@@ -44,5 +44,11 @@
       "event_type": "other",
       "confidence": "medium"
     }
+  ],
+  "grade_categories": [
+    {"name": "Homework",      "weight": 30, "drop_lowest": 1, "notes": null},
+    {"name": "Midterm",       "weight": 25, "drop_lowest": 0, "notes": null},
+    {"name": "Final",         "weight": 35, "drop_lowest": 0, "notes": "must pass final to pass course"},
+    {"name": "Participation", "weight": 10, "drop_lowest": 0, "notes": null}
   ]
 }

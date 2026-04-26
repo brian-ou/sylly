@@ -56,6 +56,26 @@ async def test_parse_endpoint_creates_syllabus_and_events(
     assert len(body["events"]) == 4
     assert mock_parser.called
 
+    # Grade categories should be persisted alongside events and returned.
+    assert len(body["grade_categories"]) == 4
+    cat_names = [c["name"] for c in body["grade_categories"]]
+    assert cat_names == ["Homework", "Midterm", "Final", "Participation"]
+    for cat in body["grade_categories"]:
+        assert cat["syllabus_id"] == body["syllabus_id"]
+    assert body["weight_sum"] == 100.0
+
+    # GET /syllabi/{id} surfaces them via the Syllabus.grade_categories
+    # relationship as well.
+    transport = ASGITransport(app=app_with_test_db)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        detail = await client.get(
+            f"/syllabi/{body['syllabus_id']}", headers=headers
+        )
+    assert detail.status_code == 200, detail.text
+    detail_body = detail.json()
+    assert len(detail_body["grade_categories"]) == 4
+    assert detail_body["weight_sum"] == 100.0
+
 
 @pytest.mark.asyncio
 async def test_parse_rejects_non_pdf(app_with_test_db, test_user):

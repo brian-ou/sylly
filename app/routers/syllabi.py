@@ -26,9 +26,11 @@ from app.exceptions import (
     RateLimitExceededError,
 )
 from app.models.event import ConfidenceLevel, Event, EventType
+from app.models.grade_category import GradeCategory
 from app.models.syllabus import Syllabus
 from app.models.user import User
 from app.schemas.event import EventRead, SyncFailure, SyncRequest, SyncResponse
+from app.schemas.grade_category import GradeCategoryRead
 from app.schemas.syllabus import ParseResponse, SyllabusDetail, SyllabusListItem
 from app.services.claude_parser import parse_syllabus_pdf
 from app.services.google_calendar import (
@@ -162,9 +164,24 @@ async def parse_syllabus(
         db.add(ev)
         db_events.append(ev)
 
+    db_categories: List[GradeCategory] = []
+    for idx, pgc in enumerate(parsed.grade_categories):
+        gc = GradeCategory(
+            syllabus_id=syllabus.id,
+            name=pgc.name,
+            weight=pgc.weight,
+            drop_lowest=pgc.drop_lowest,
+            notes=pgc.notes,
+            sort_order=idx,
+        )
+        db.add(gc)
+        db_categories.append(gc)
+
     await db.commit()
     for ev in db_events:
         await db.refresh(ev)
+    for gc in db_categories:
+        await db.refresh(gc)
     await db.refresh(syllabus)
 
     return ParseResponse(
@@ -173,6 +190,8 @@ async def parse_syllabus(
         course_code=syllabus.course_code,
         term=syllabus.term,
         events=[EventRead.model_validate(e) for e in db_events],
+        grade_categories=[GradeCategoryRead.model_validate(gc) for gc in db_categories],
+        weight_sum=float(sum(float(gc.weight) for gc in db_categories)),
     )
 
 
@@ -227,7 +246,10 @@ async def get_syllabus(
     """Return a single syllabus and its associated events."""
     stmt = (
         select(Syllabus)
-        .options(selectinload(Syllabus.events))
+        .options(
+            selectinload(Syllabus.events),
+            selectinload(Syllabus.grade_categories),
+        )
         .where(Syllabus.id == syllabus_id, Syllabus.user_id == current_user.id)
     )
     syllabus = (await db.execute(stmt)).scalar_one_or_none()
@@ -242,6 +264,10 @@ async def get_syllabus(
         created_at=syllabus.created_at,
         updated_at=syllabus.updated_at,
         events=[EventRead.model_validate(e) for e in syllabus.events],
+        grade_categories=[
+            GradeCategoryRead.model_validate(gc) for gc in syllabus.grade_categories
+        ],
+        weight_sum=float(sum(float(gc.weight) for gc in syllabus.grade_categories)),
     )
 
 
@@ -258,7 +284,10 @@ async def delete_syllabus(
     """Delete a syllabus. Synced events are best-effort removed from Google."""
     stmt = (
         select(Syllabus)
-        .options(selectinload(Syllabus.events))
+        .options(
+            selectinload(Syllabus.events),
+            selectinload(Syllabus.grade_categories),
+        )
         .where(Syllabus.id == syllabus_id, Syllabus.user_id == current_user.id)
     )
     syllabus = (await db.execute(stmt)).scalar_one_or_none()

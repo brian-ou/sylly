@@ -14,6 +14,7 @@ from app.database import Base
 if TYPE_CHECKING:
     from app.models.user import User
     from app.models.event import Event
+    from app.models.grade_category import GradeCategory
 
 
 class Syllabus(Base):
@@ -53,4 +54,10 @@ class Syllabus(Base):
     user: Mapped["User"] = relationship("User", back_populates="syllabi")
     events: Mapped[List["Event"]] = relationship(
         "Event", back_populates="syllabus", cascade="all, delete-orphan"
+    )
+    grade_categories: Mapped[List["GradeCategory"]] = relationship(
+        "GradeCategory",
+        back_populates="syllabus",
+        cascade="all, delete-orphan",
+        order_by="GradeCategory.sort_order, GradeCategory.name",
     )

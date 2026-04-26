@@ -17,10 +17,10 @@ from app.schemas.syllabus import ParsedSyllabus
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
-    "You extract dated academic events from course syllabi. "
-    "You return ONLY valid JSON matching the schema provided — no preamble, "
-    "no markdown fences, no explanation. If a field is unknown, use null. "
-    "If you are uncertain about a date, set confidence to \"low\"."
+    "You extract dated academic events AND the grading scheme from course "
+    "syllabi. You return ONLY valid JSON matching the schema provided — no "
+    "preamble, no markdown fences, no explanation. If a field is unknown, "
+    "use null. If you are uncertain about a date, set confidence to \"low\"."
 )
 
 OUTPUT_SCHEMA = """{
@@ -39,6 +39,14 @@ OUTPUT_SCHEMA = """{
       "event_type": "assignment|exam|lecture|holiday|office_hours|other",
       "confidence": "high|medium|low"
     }
+  ],
+  "grade_categories": [
+    {
+      "name": "string (e.g. Homework, Midterm, Final, Participation)",
+      "weight": "number 0-100 (percentage points)",
+      "drop_lowest": "integer >= 0 (how many of the lowest scores are dropped, 0 if none)",
+      "notes": "string or null (any extra rule, e.g. 'must pass final to pass course')"
+    }
   ]
 }"""
 
@@ -51,6 +59,15 @@ EXTRACTION_INSTRUCTIONS = """Extraction instructions:
 - Set is_all_day: true for assignments without a specific time.
 - Use these event_type values exactly: assignment, exam, lecture, holiday, office_hours, other.
 - Set confidence: "low" when the date is ambiguous, the year is inferred, or the time is unclear.
+- Look for a "Grading", "Evaluation", "Assessment", or "Course policies" section
+  and emit one entry per weighted bucket in `grade_categories`. Use the
+  syllabus's own labels (e.g. "Homework", "Problem Sets", "Midterm",
+  "Final Exam", "Participation"). Express weight as a number in 0-100; a
+  syllabus that says "30%" becomes weight: 30. If the syllabus mentions
+  dropping the lowest N scores in a bucket, set drop_lowest to N. Put any
+  qualifying language (e.g. "must pass exam to pass course") in notes.
+- If no grading scheme is present, return an empty array — do NOT invent
+  weights.
 """
 
 
@@ -181,5 +198,20 @@ def parse_syllabus_pdf(
     except Exception as e:
         logger.error("Claude output failed schema validation: %s", e)
         raise ClaudeParseError(f"Claude output did not match schema: {e}") from e
+
+    # Sanitize grade_categories: drop blank names and dedupe case-insensitively
+    # so we don't violate the unique (syllabus_id, lower(name)) index when we
+    # persist them. First-occurrence wins.
+    seen: set[str] = set()
+    cleaned_categories = []
+    for gc in parsed.grade_categories:
+        if not gc.name:
+            continue
+        key = gc.name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned_categories.append(gc)
+    parsed.grade_categories = cleaned_categories
 
     return parsed

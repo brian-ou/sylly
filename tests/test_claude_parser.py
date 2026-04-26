@@ -46,6 +46,45 @@ def test_parse_syllabus_returns_parsed_model():
     titles = [e.title for e in result.events]
     assert "Midterm Exam" in titles
 
+    # Grade categories surface from the same JSON contract.
+    assert len(result.grade_categories) == 4
+    by_name = {gc.name: gc for gc in result.grade_categories}
+    assert by_name["Homework"].weight == 30
+    assert by_name["Homework"].drop_lowest == 1
+    assert by_name["Final"].notes == "must pass final to pass course"
+    assert sum(gc.weight for gc in result.grade_categories) == 100
+
+
+def test_parse_grade_categories_clamp_and_dedupe():
+    payload = {
+        "course_name": "X",
+        "events": [],
+        "grade_categories": [
+            {"name": "Homework", "weight": 200, "drop_lowest": -1, "notes": None},
+            {"name": "homework", "weight": 10},  # dupe (case-insensitive)
+            {"name": "  ", "weight": 5},  # blank name -> dropped
+            {"name": "Midterm", "weight": -5},  # negative -> 0
+            {"name": "Final", "weight": "not a number"},  # bad -> 0
+        ],
+    }
+    client = _mock_anthropic_with_text(json.dumps(payload))
+    result = parse_syllabus_pdf(pdf_bytes=b"%PDF-1.4 fake", client=client)
+
+    names = [gc.name for gc in result.grade_categories]
+    assert names == ["Homework", "Midterm", "Final"]
+    by_name = {gc.name: gc for gc in result.grade_categories}
+    assert by_name["Homework"].weight == 100  # clamped down
+    assert by_name["Homework"].drop_lowest == 0  # clamped up from -1
+    assert by_name["Midterm"].weight == 0
+    assert by_name["Final"].weight == 0
+
+
+def test_parse_missing_grade_categories_defaults_to_empty():
+    payload = {"course_name": "X", "events": []}
+    client = _mock_anthropic_with_text(json.dumps(payload))
+    result = parse_syllabus_pdf(pdf_bytes=b"%PDF-1.4 fake", client=client)
+    assert result.grade_categories == []
+
 
 def test_parse_strips_code_fences():
     fixture_text = FIXTURE_PATH.read_text()

@@ -2,5 +2,13 @@
 from app.models.user import User
 from app.models.syllabus import Syllabus
 from app.models.event import Event, EventType, ConfidenceLevel
+from app.models.grade_category import GradeCategory
 
-__all__ = ["User", "Syllabus", "Event", "EventType", "ConfidenceLevel"]
+__all__ = [
+    "User",
+    "Syllabus",
+    "Event",
+    "EventType",
+    "ConfidenceLevel",
+    "GradeCategory",
+]
