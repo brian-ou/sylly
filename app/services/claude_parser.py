@@ -144,7 +144,11 @@ def parse_syllabus_pdf(
     try:
         response = client.messages.create(
             model=settings.ANTHROPIC_MODEL,
-            max_tokens=4096,
+            # Long syllabi (e.g., a full semester of dated readings + assignments
+            # + recurring lectures + exams) can easily exceed 4K output tokens.
+            # 8192 is supported by all current Sonnet and Opus models without
+            # any extended-output beta header.
+            max_tokens=8192,
             system=SYSTEM_PROMPT,
             messages=messages,
         )
