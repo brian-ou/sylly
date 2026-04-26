@@ -16,6 +16,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.config import get_settings
 from app.exceptions import AppError
 from app.routers import auth as auth_router
+from app.routers import chat as chat_router
 from app.routers import events as events_router
 from app.routers import grade_categories as grade_categories_router
 from app.routers import syllabi as syllabi_router
@@ -138,6 +139,7 @@ app.include_router(auth_router.router)
 app.include_router(syllabi_router.router)
 app.include_router(events_router.router)
 app.include_router(grade_categories_router.router)
+app.include_router(chat_router.router)
 
 
 @app.get("/health", tags=["meta"], summary="Liveness probe")

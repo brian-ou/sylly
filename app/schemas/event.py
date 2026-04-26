@@ -23,7 +23,7 @@ class EventBase(BaseModel):
 
 class EventRead(EventBase):
     id: uuid.UUID
-    syllabus_id: uuid.UUID
+    syllabus_id: Optional[uuid.UUID] = None
     google_calendar_id: Optional[str] = None
     google_event_id: Optional[str] = None
     synced_at: Optional[datetime] = None
@@ -31,6 +31,20 @@ class EventRead(EventBase):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class EventCreate(BaseModel):
+    """Payload for creating a standalone or syllabus-attached event."""
+
+    title: str
+    start_datetime: datetime
+    description: Optional[str] = None
+    end_datetime: Optional[datetime] = None
+    is_all_day: bool = False
+    recurrence_rule: Optional[str] = None
+    event_type: EventType = EventType.OTHER
+    confidence: ConfidenceLevel = ConfidenceLevel.HIGH
+    syllabus_id: Optional[uuid.UUID] = None
 
 
 class EventUpdate(BaseModel):

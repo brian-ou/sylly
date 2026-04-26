@@ -4,7 +4,7 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import (
     Boolean,
@@ -58,11 +58,11 @@ class Event(Base):
         primary_key=True,
         default=uuid.uuid4,
     )
-    syllabus_id: Mapped[uuid.UUID] = mapped_column(
+    syllabus_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         PG_UUID(as_uuid=True),
         ForeignKey("syllabi.id", ondelete="CASCADE"),
         index=True,
-        nullable=False,
+        nullable=True,
     )
     user_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True),
@@ -120,5 +120,7 @@ class Event(Base):
         nullable=False,
     )
 
-    syllabus: Mapped["Syllabus"] = relationship("Syllabus", back_populates="events")
+    syllabus: Mapped[Optional["Syllabus"]] = relationship(
+        "Syllabus", back_populates="events"
+    )
     user: Mapped["User"] = relationship("User", back_populates="events")

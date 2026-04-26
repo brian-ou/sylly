@@ -54,6 +54,7 @@ EXTRACTION_INSTRUCTIONS = """Extraction instructions:
 - Identify course name, course code, and term.
 - Extract every dated item: lectures, assignments, readings, exams, project milestones, holidays, office hours, drop deadlines.
 - For recurring events (e.g. "MWF lectures Aug 26 - Dec 5"), output ONE event with a recurrence_rule in RFC 5545 RRULE format, not many individual events.
+- IMPORTANT: For regularly scheduled class meetings (lectures, sections, labs, recitations), output ONE recurring event per pattern even when the syllabus lists each session's topic separately. Use a generic title like "Lecture", "Section", or "Lab" — do NOT create one event per session for each weekly topic. Per-session topics belong in a syllabus, not on a calendar. This rule does not apply to exams, assignments, or one-off events, which should still be listed individually.
 - For events without an explicit year, infer it from the term/syllabus header.
 - Use ISO 8601 for dates and times. Use the syllabus's stated timezone if given, otherwise leave as a naive datetime and the backend will assume America/Los_Angeles.
 - Set is_all_day: true for assignments without a specific time.

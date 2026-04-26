@@ -47,3 +47,6 @@ class SlidingWindowRateLimiter:
 
 # Default parser limiter: 10 calls per hour per user
 parse_limiter = SlidingWindowRateLimiter(limit=10, window_seconds=3600)
+
+# Chat limiter: 60 calls per hour per user
+chat_limiter = SlidingWindowRateLimiter(limit=60, window_seconds=3600)
