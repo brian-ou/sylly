@@ -7,6 +7,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 from pypdf import PdfReader
@@ -57,15 +58,27 @@ def _sanitize_filename(name: str) -> str:
 
 
 def _parse_iso_datetime(s: str) -> datetime:
-    """Parse an ISO 8601 datetime string. Naive datetimes are assumed UTC stored value;
-    callers should set the canonical TZ when sending to Google."""
-    # Pydantic generally normalizes; this is a fallback for raw strings.
+    """Parse an ISO 8601 datetime string into a timezone-aware datetime.
+
+    PostgreSQL `timestamptz` columns + asyncpg reject naive datetimes, so any
+    naive value coming back from Claude must be localized. Per the spec, naive
+    timestamps are assumed to be in the configured DEFAULT_TIMEZONE (e.g.
+    America/Los_Angeles).
+    """
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
     except ValueError as e:
         raise InvalidInputError(f"Invalid datetime: {s}") from e
+
+    if dt.tzinfo is None:
+        try:
+            tz = ZoneInfo(get_settings().DEFAULT_TIMEZONE)
+        except Exception:
+            tz = ZoneInfo("America/Los_Angeles")
+        dt = dt.replace(tzinfo=tz)
+    return dt
 
 
 @router.post(
