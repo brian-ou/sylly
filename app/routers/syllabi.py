@@ -1,0 +1,359 @@
+"""Syllabus routes: parse, list, get, delete, sync."""
+from __future__ import annotations
+
+import io
+import logging
+import re
+import uuid
+from datetime import datetime, timezone
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, File, Form, UploadFile
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.config import get_settings
+from app.database import get_db
+from app.deps import get_current_user
+from app.exceptions import (
+    GoogleAPIError,
+    InvalidInputError,
+    NotFoundError,
+    PDFTooLargeError,
+    RateLimitExceededError,
+)
+from app.models.event import ConfidenceLevel, Event, EventType
+from app.models.syllabus import Syllabus
+from app.models.user import User
+from app.schemas.event import EventRead, SyncFailure, SyncRequest, SyncResponse
+from app.schemas.syllabus import ParseResponse, SyllabusDetail, SyllabusListItem
+from app.services.claude_parser import parse_syllabus_pdf
+from app.services.google_calendar import (
+    delete_event as gcal_delete_event,
+    get_calendar_service,
+    get_or_create_calendar,
+    insert_event as gcal_insert_event,
+    update_event as gcal_update_event,
+)
+from app.services.rate_limit import parse_limiter
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["syllabi"])
+
+_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._\- ]")
+
+
+def _sanitize_filename(name: str) -> str:
+    """Strip path separators and unsafe characters from an uploaded filename."""
+    base = name.replace("\\", "/").split("/")[-1]
+    cleaned = _FILENAME_SAFE.sub("_", base).strip()
+    return cleaned[:255] or "syllabus.pdf"
+
+
+def _parse_iso_datetime(s: str) -> datetime:
+    """Parse an ISO 8601 datetime string. Naive datetimes are assumed UTC stored value;
+    callers should set the canonical TZ when sending to Google."""
+    # Pydantic generally normalizes; this is a fallback for raw strings.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError as e:
+        raise InvalidInputError(f"Invalid datetime: {s}") from e
+
+
+@router.post(
+    "/syllabi/parse",
+    response_model=ParseResponse,
+    summary="Upload a syllabus PDF, parse with Claude, and stage events",
+)
+async def parse_syllabus(
+    file: UploadFile = File(..., description="Syllabus PDF (<=20MB, <=100 pages)"),
+    course_hint: Optional[str] = Form(default=None),
+    term_hint: Optional[str] = Form(default=None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ParseResponse:
+    """Upload a syllabus PDF and extract dated events.
+
+    Validates the PDF, sends it to Claude, and saves the parsed syllabus and
+    its events. Events are NOT pushed to Google Calendar by this endpoint.
+    """
+    settings = get_settings()
+
+    # Rate limit (per user, sliding window)
+    if not parse_limiter.check(str(current_user.id)):
+        raise RateLimitExceededError(
+            f"Limit is {settings.PARSE_RATE_LIMIT} parse calls per hour"
+        )
+
+    if file.content_type != "application/pdf":
+        raise InvalidInputError("File must be application/pdf")
+
+    pdf_bytes = await file.read()
+    if len(pdf_bytes) > settings.MAX_PDF_BYTES:
+        raise PDFTooLargeError(
+            f"PDF exceeds maximum size of {settings.MAX_PDF_BYTES} bytes"
+        )
+
+    try:
+        reader = PdfReader(stream=io.BytesIO(pdf_bytes))
+        page_count = len(reader.pages)
+    except PdfReadError as e:
+        raise InvalidInputError(f"Could not read PDF: {e}") from e
+    except Exception as e:  # pypdf can raise non-PdfReadError on malformed input
+        raise InvalidInputError(f"Could not read PDF: {e}") from e
+
+    if page_count > settings.MAX_PDF_PAGES:
+        raise PDFTooLargeError(
+            f"PDF has {page_count} pages; max is {settings.MAX_PDF_PAGES}"
+        )
+
+    parsed = parse_syllabus_pdf(
+        pdf_bytes,
+        course_hint=course_hint,
+        term_hint=term_hint,
+    )
+
+    safe_name = _sanitize_filename(file.filename or "syllabus.pdf")
+
+    syllabus = Syllabus(
+        user_id=current_user.id,
+        filename=safe_name,
+        course_name=parsed.course_name,
+        course_code=parsed.course_code,
+        term=parsed.term,
+        parsed_events=parsed.model_dump(mode="json"),
+    )
+    db.add(syllabus)
+    await db.flush()
+
+    db_events: List[Event] = []
+    for pe in parsed.events:
+        try:
+            start_dt = _parse_iso_datetime(pe.start_datetime)
+        except Exception:
+            logger.warning("Skipping event with invalid start_datetime: %s", pe.title)
+            continue
+        end_dt: Optional[datetime] = None
+        if pe.end_datetime:
+            try:
+                end_dt = _parse_iso_datetime(pe.end_datetime)
+            except Exception:
+                end_dt = None
+
+        ev = Event(
+            syllabus_id=syllabus.id,
+            user_id=current_user.id,
+            title=pe.title,
+            description=pe.description,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
+            is_all_day=bool(pe.is_all_day),
+            recurrence_rule=pe.recurrence_rule,
+            event_type=EventType(pe.event_type),
+            confidence=ConfidenceLevel(pe.confidence),
+            synced_at=None,
+        )
+        db.add(ev)
+        db_events.append(ev)
+
+    await db.commit()
+    for ev in db_events:
+        await db.refresh(ev)
+    await db.refresh(syllabus)
+
+    return ParseResponse(
+        syllabus_id=syllabus.id,
+        course_name=syllabus.course_name,
+        course_code=syllabus.course_code,
+        term=syllabus.term,
+        events=[EventRead.model_validate(e) for e in db_events],
+    )
+
+
+@router.get(
+    "/syllabi",
+    response_model=List[SyllabusListItem],
+    summary="List the current user's syllabi",
+)
+async def list_syllabi(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> List[SyllabusListItem]:
+    """Return the current user's syllabi, including event counts."""
+    stmt = (
+        select(
+            Syllabus.id,
+            Syllabus.filename,
+            Syllabus.course_name,
+            Syllabus.term,
+            Syllabus.created_at,
+            func.count(Event.id).label("event_count"),
+        )
+        .outerjoin(Event, Event.syllabus_id == Syllabus.id)
+        .where(Syllabus.user_id == current_user.id)
+        .group_by(Syllabus.id)
+        .order_by(Syllabus.created_at.desc())
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        SyllabusListItem(
+            id=r.id,
+            filename=r.filename,
+            course_name=r.course_name,
+            term=r.term,
+            event_count=r.event_count,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+
+@router.get(
+    "/syllabi/{syllabus_id}",
+    response_model=SyllabusDetail,
+    summary="Get a syllabus and its events",
+)
+async def get_syllabus(
+    syllabus_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SyllabusDetail:
+    """Return a single syllabus and its associated events."""
+    stmt = (
+        select(Syllabus)
+        .options(selectinload(Syllabus.events))
+        .where(Syllabus.id == syllabus_id, Syllabus.user_id == current_user.id)
+    )
+    syllabus = (await db.execute(stmt)).scalar_one_or_none()
+    if syllabus is None:
+        raise NotFoundError("Syllabus not found")
+    return SyllabusDetail(
+        id=syllabus.id,
+        filename=syllabus.filename,
+        course_name=syllabus.course_name,
+        course_code=syllabus.course_code,
+        term=syllabus.term,
+        created_at=syllabus.created_at,
+        updated_at=syllabus.updated_at,
+        events=[EventRead.model_validate(e) for e in syllabus.events],
+    )
+
+
+@router.delete(
+    "/syllabi/{syllabus_id}",
+    status_code=204,
+    summary="Delete a syllabus and its events (also from Google Calendar)",
+)
+async def delete_syllabus(
+    syllabus_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Delete a syllabus. Synced events are best-effort removed from Google."""
+    stmt = (
+        select(Syllabus)
+        .options(selectinload(Syllabus.events))
+        .where(Syllabus.id == syllabus_id, Syllabus.user_id == current_user.id)
+    )
+    syllabus = (await db.execute(stmt)).scalar_one_or_none()
+    if syllabus is None:
+        raise NotFoundError("Syllabus not found")
+
+    synced_events = [
+        e for e in syllabus.events if e.google_calendar_id and e.google_event_id
+    ]
+    if synced_events:
+        try:
+            service = await get_calendar_service(current_user)
+        except Exception as e:
+            logger.warning(
+                "Could not get calendar service while deleting syllabus %s: %s",
+                syllabus_id,
+                e,
+            )
+            service = None
+        if service is not None:
+            for e in synced_events:
+                try:
+                    await gcal_delete_event(
+                        service, e.google_calendar_id, e.google_event_id
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to delete Google event %s: %s",
+                        e.google_event_id,
+                        exc,
+                    )
+
+    await db.delete(syllabus)
+    await db.commit()
+
+
+@router.post(
+    "/syllabi/{syllabus_id}/sync",
+    response_model=SyncResponse,
+    summary="Push events for a syllabus to Google Calendar",
+)
+async def sync_syllabus(
+    syllabus_id: uuid.UUID,
+    body: SyncRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SyncResponse:
+    """Push events to a Google Calendar named `calendar_name`.
+
+    If `event_ids` is omitted, all unsynced events for the syllabus are pushed.
+    The operation is idempotent: events with an existing google_event_id are
+    updated rather than duplicated.
+    """
+    stmt = (
+        select(Syllabus)
+        .options(selectinload(Syllabus.events))
+        .where(Syllabus.id == syllabus_id, Syllabus.user_id == current_user.id)
+    )
+    syllabus = (await db.execute(stmt)).scalar_one_or_none()
+    if syllabus is None:
+        raise NotFoundError("Syllabus not found")
+
+    if body.event_ids:
+        wanted = set(body.event_ids)
+        events = [e for e in syllabus.events if e.id in wanted]
+    else:
+        events = [e for e in syllabus.events if e.synced_at is None]
+
+    if not events:
+        return SyncResponse(synced=0, failed=[])
+
+    service = await get_calendar_service(current_user)
+    calendar_id = await get_or_create_calendar(service, body.calendar_name)
+
+    synced_count = 0
+    failures: List[SyncFailure] = []
+
+    for ev in events:
+        try:
+            if ev.google_event_id and ev.google_calendar_id == calendar_id:
+                await gcal_update_event(
+                    service, calendar_id, ev.google_event_id, ev
+                )
+            else:
+                google_event_id = await gcal_insert_event(service, calendar_id, ev)
+                ev.google_event_id = google_event_id
+            ev.google_calendar_id = calendar_id
+            ev.synced_at = datetime.now(timezone.utc)
+            synced_count += 1
+        except GoogleAPIError as e:
+            failures.append(SyncFailure(event_id=ev.id, reason=str(e)))
+        except Exception as e:
+            logger.exception("Unexpected error syncing event %s", ev.id)
+            failures.append(SyncFailure(event_id=ev.id, reason=str(e)))
+
+    await db.commit()
+
+    return SyncResponse(synced=synced_count, failed=failures)

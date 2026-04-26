@@ -1,0 +1,48 @@
+{
+  "course_name": "Introduction to Macroeconomics",
+  "course_code": "ECON 140",
+  "term": "Fall 2026",
+  "timezone": "America/Los_Angeles",
+  "events": [
+    {
+      "title": "Lecture: Course Introduction",
+      "description": "Welcome and syllabus overview",
+      "start_datetime": "2026-08-26T10:00:00",
+      "end_datetime": "2026-08-26T10:50:00",
+      "is_all_day": false,
+      "recurrence_rule": "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=20261205T235959Z",
+      "event_type": "lecture",
+      "confidence": "high"
+    },
+    {
+      "title": "Problem Set 1 due",
+      "description": "Submit on Gradescope by 11:59pm",
+      "start_datetime": "2026-09-10T23:59:00",
+      "end_datetime": null,
+      "is_all_day": false,
+      "recurrence_rule": null,
+      "event_type": "assignment",
+      "confidence": "high"
+    },
+    {
+      "title": "Midterm Exam",
+      "description": "In-class midterm",
+      "start_datetime": "2026-10-14T10:00:00",
+      "end_datetime": "2026-10-14T11:30:00",
+      "is_all_day": false,
+      "recurrence_rule": null,
+      "event_type": "exam",
+      "confidence": "high"
+    },
+    {
+      "title": "Drop deadline",
+      "description": "Last day to drop with W",
+      "start_datetime": "2026-10-30",
+      "end_datetime": null,
+      "is_all_day": true,
+      "recurrence_rule": null,
+      "event_type": "other",
+      "confidence": "medium"
+    }
+  ]
+}
