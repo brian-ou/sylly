@@ -82,11 +82,25 @@ class Event(Base):
     )
     is_all_day: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     recurrence_rule: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # values_callable forces SQLAlchemy to send the enum *values* (lowercase)
+    # rather than the *names* (uppercase). The PG enum types were created with
+    # the lowercase values, so without this we'd hit
+    # `invalid input value for enum event_type: "LECTURE"`.
     event_type: Mapped[EventType] = mapped_column(
-        SAEnum(EventType, name="event_type"), nullable=False, default=EventType.OTHER
+        SAEnum(
+            EventType,
+            name="event_type",
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
+        nullable=False,
+        default=EventType.OTHER,
     )
     confidence: Mapped[ConfidenceLevel] = mapped_column(
-        SAEnum(ConfidenceLevel, name="confidence_level"),
+        SAEnum(
+            ConfidenceLevel,
+            name="confidence_level",
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
         nullable=False,
         default=ConfidenceLevel.MEDIUM,
     )
