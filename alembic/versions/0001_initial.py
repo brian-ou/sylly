@@ -21,6 +21,40 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # Defensive cleanup: if a previous failed run left partial state behind,
+    # remove it so we can start cleanly. Safe on a fresh database (DROP IF
+    # EXISTS is a no-op when the object isn't there).
+    op.execute("DROP TABLE IF EXISTS events CASCADE")
+    op.execute("DROP TABLE IF EXISTS syllabi CASCADE")
+    op.execute("DROP TABLE IF EXISTS users CASCADE")
+    op.execute("DROP TYPE IF EXISTS event_type CASCADE")
+    op.execute("DROP TYPE IF EXISTS confidence_level CASCADE")
+
+    # Define the enum types ONCE. create_type=False tells SQLAlchemy not to
+    # auto-create them when columns referencing them are added to a table —
+    # we'll create them explicitly below.
+    event_type_enum = postgresql.ENUM(
+        "assignment",
+        "exam",
+        "lecture",
+        "holiday",
+        "office_hours",
+        "other",
+        name="event_type",
+        create_type=False,
+    )
+    confidence_level_enum = postgresql.ENUM(
+        "high",
+        "medium",
+        "low",
+        name="confidence_level",
+        create_type=False,
+    )
+
+    # Now create the enum types in Postgres explicitly.
+    event_type_enum.create(op.get_bind(), checkfirst=False)
+    confidence_level_enum.create(op.get_bind(), checkfirst=False)
+
     op.create_table(
         "users",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
@@ -60,7 +94,9 @@ def upgrade() -> None:
         sa.Column("course_name", sa.String(length=512), nullable=True),
         sa.Column("course_code", sa.String(length=128), nullable=True),
         sa.Column("term", sa.String(length=128), nullable=True),
-        sa.Column("parsed_events", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column(
+            "parsed_events", postgresql.JSONB(astext_type=sa.Text()), nullable=False
+        ),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -75,21 +111,6 @@ def upgrade() -> None:
         ),
     )
     op.create_index("ix_syllabi_user_id", "syllabi", ["user_id"])
-
-    event_type = postgresql.ENUM(
-        "assignment",
-        "exam",
-        "lecture",
-        "holiday",
-        "office_hours",
-        "other",
-        name="event_type",
-    )
-    event_type.create(op.get_bind(), checkfirst=True)
-    confidence_level = postgresql.ENUM(
-        "high", "medium", "low", name="confidence_level"
-    )
-    confidence_level.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
         "events",
@@ -112,29 +133,14 @@ def upgrade() -> None:
         sa.Column("description", sa.Text(), nullable=True),
         sa.Column("start_datetime", sa.DateTime(timezone=True), nullable=False),
         sa.Column("end_datetime", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("is_all_day", sa.Boolean(), nullable=False, server_default=sa.false()),
+        sa.Column(
+            "is_all_day", sa.Boolean(), nullable=False, server_default=sa.false()
+        ),
         sa.Column("recurrence_rule", sa.String(length=1024), nullable=True),
-        sa.Column(
-            "event_type",
-            sa.Enum(
-                "assignment",
-                "exam",
-                "lecture",
-                "holiday",
-                "office_hours",
-                "other",
-                name="event_type",
-                create_type=False,
-            ),
-            nullable=False,
-        ),
-        sa.Column(
-            "confidence",
-            sa.Enum(
-                "high", "medium", "low", name="confidence_level", create_type=False
-            ),
-            nullable=False,
-        ),
+        # IMPORTANT: reuse the same enum instances created above so SQLAlchemy
+        # does not try to re-CREATE TYPE during table creation.
+        sa.Column("event_type", event_type_enum, nullable=False),
+        sa.Column("confidence", confidence_level_enum, nullable=False),
         sa.Column("synced_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
             "created_at",
