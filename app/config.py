@@ -63,6 +63,18 @@ class Settings(BaseSettings):
             raise ValueError("ALLOWED_ORIGINS must not be empty")
         return v
 
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def _normalize_database_url(cls, v: str) -> str:
+        """Auto-upgrade plain postgresql:// URLs (e.g. from Railway/Heroku) to
+        the async driver asyncpg, which is what our SQLAlchemy engine expects.
+        """
+        if v.startswith("postgres://"):
+            v = "postgresql://" + v[len("postgres://"):]
+        if v.startswith("postgresql://"):
+            v = "postgresql+asyncpg://" + v[len("postgresql://"):]
+        return v
+
     @property
     def allowed_origins_list(self) -> List[str]:
         """Comma-separated origins parsed into a list."""
