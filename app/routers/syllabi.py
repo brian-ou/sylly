@@ -81,6 +81,59 @@ def _parse_iso_datetime(s: str) -> datetime:
     return dt
 
 
+def _cap_recurrence_at_term_end(rrule: str, term_end: datetime) -> str:
+    """Ensure an RRULE's UNTIL clause is no later than `term_end`.
+
+    Claude sometimes omits UNTIL on recurring events (e.g. weekly office hours),
+    which causes Google Calendar to extend them forever. This caps every
+    recurrence at the term's last dated event. If UNTIL is missing, it is
+    added; if present but later than `term_end`, it is replaced; if already
+    earlier, it is left alone.
+    """
+    if not rrule:
+        return rrule
+
+    # Normalize: strip "RRULE:" prefix if present
+    upper = rrule.upper()
+    if upper.startswith("RRULE:"):
+        body = rrule[len("RRULE:"):]
+        prefix = "RRULE:"
+    else:
+        body = rrule
+        prefix = ""
+
+    until_utc = term_end.astimezone(timezone.utc)
+    until_str = until_utc.strftime("%Y%m%dT%H%M%SZ")
+
+    parts = body.split(";")
+    found_until = False
+    new_parts: List[str] = []
+    for part in parts:
+        if part.upper().startswith("UNTIL="):
+            found_until = True
+            existing = part[len("UNTIL="):]
+            try:
+                if "T" in existing:
+                    existing_dt = datetime.strptime(existing, "%Y%m%dT%H%M%SZ")
+                else:
+                    existing_dt = datetime.strptime(existing, "%Y%m%d")
+                existing_dt = existing_dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                existing_dt = None
+
+            if existing_dt is None or existing_dt > until_utc:
+                new_parts.append(f"UNTIL={until_str}")
+            else:
+                new_parts.append(part)
+        else:
+            new_parts.append(part)
+
+    if not found_until:
+        new_parts.append(f"UNTIL={until_str}")
+
+    return prefix + ";".join(new_parts)
+
+
 @router.post(
     "/syllabi/parse",
     response_model=ParseResponse,
@@ -147,7 +200,12 @@ async def parse_syllabus(
     db.add(syllabus)
     await db.flush()
 
-    db_events: List[Event] = []
+    # First pass: parse all dates so we can compute the term-end cap.
+    # The latest event date in the syllabus (typically the final exam) is the
+    # natural end of the academic term. We use this to cap recurring events
+    # like office hours so they don't extend indefinitely on Google Calendar.
+    parsed_events: List[tuple] = []  # (pe, start_dt, end_dt)
+    candidate_term_ends: List[datetime] = []
     for pe in parsed.events:
         try:
             start_dt = _parse_iso_datetime(pe.start_datetime)
@@ -161,6 +219,26 @@ async def parse_syllabus(
             except Exception:
                 end_dt = None
 
+        parsed_events.append((pe, start_dt, end_dt))
+        # Term-end candidate is the latest non-recurring event date, since
+        # recurring events without UNTIL would otherwise dominate.
+        if not pe.recurrence_rule:
+            candidate_term_ends.append(end_dt or start_dt)
+
+    term_end: Optional[datetime] = (
+        max(candidate_term_ends) if candidate_term_ends else None
+    )
+    if term_end is not None:
+        logger.info(
+            "Detected term end for syllabus %s: %s", syllabus.id, term_end.isoformat()
+        )
+
+    db_events: List[Event] = []
+    for pe, start_dt, end_dt in parsed_events:
+        rrule = pe.recurrence_rule
+        if rrule and term_end is not None:
+            rrule = _cap_recurrence_at_term_end(rrule, term_end)
+
         ev = Event(
             syllabus_id=syllabus.id,
             user_id=current_user.id,
@@ -169,7 +247,7 @@ async def parse_syllabus(
             start_datetime=start_dt,
             end_datetime=end_dt,
             is_all_day=bool(pe.is_all_day),
-            recurrence_rule=pe.recurrence_rule,
+            recurrence_rule=rrule,
             event_type=EventType(pe.event_type),
             confidence=ConfidenceLevel(pe.confidence),
             synced_at=None,
