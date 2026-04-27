@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.models.event import ConfidenceLevel, EventType
 
@@ -22,15 +22,32 @@ class EventBase(BaseModel):
 
 
 class EventRead(EventBase):
-    id: uuid.UUID
+    # Plain UUID string for stored events; composite "<uuid>:<iso>" for
+    # expanded recurring instances. The router accepts either form on
+    # PATCH/DELETE.
+    id: str
     syllabus_id: Optional[uuid.UUID] = None
     google_calendar_id: Optional[str] = None
     google_event_id: Optional[str] = None
     synced_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+    # Set when this row is one expanded occurrence of a recurring master
+    # event. `master_event_id` is the master's UUID and `occurrence_start`
+    # is the original (un-overridden) occurrence start. Both are None for
+    # one-off events.
+    master_event_id: Optional[uuid.UUID] = None
+    occurrence_start: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _coerce_id(cls, v: object) -> object:
+        # ORM rows give us a UUID; expansion code gives us a composite str.
+        if isinstance(v, uuid.UUID):
+            return str(v)
+        return v
 
 
 class EventCreate(BaseModel):

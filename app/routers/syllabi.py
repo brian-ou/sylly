@@ -34,12 +34,10 @@ from app.schemas.event import EventRead, SyncFailure, SyncRequest, SyncResponse
 from app.schemas.grade_category import GradeCategoryRead
 from app.schemas.syllabus import ParseResponse, SyllabusDetail, SyllabusListItem
 from app.services.claude_parser import parse_syllabus_pdf
+from app.services.event_sync import sync_event_to_google
 from app.services.google_calendar import (
     delete_event as gcal_delete_event,
     get_calendar_service,
-    get_or_create_calendar,
-    insert_event as gcal_insert_event,
-    update_event as gcal_update_event,
 )
 from app.services.rate_limit import parse_limiter
 
@@ -450,23 +448,14 @@ async def sync_syllabus(
     if not events:
         return SyncResponse(synced=0, failed=[])
 
-    service = await get_calendar_service(current_user)
-    calendar_id = await get_or_create_calendar(service, body.calendar_name)
-
     synced_count = 0
     failures: List[SyncFailure] = []
 
     for ev in events:
         try:
-            if ev.google_event_id and ev.google_calendar_id == calendar_id:
-                await gcal_update_event(
-                    service, calendar_id, ev.google_event_id, ev
-                )
-            else:
-                google_event_id = await gcal_insert_event(service, calendar_id, ev)
-                ev.google_event_id = google_event_id
-            ev.google_calendar_id = calendar_id
-            ev.synced_at = datetime.now(timezone.utc)
+            await sync_event_to_google(
+                ev, current_user, db, calendar_name=body.calendar_name
+            )
             synced_count += 1
         except GoogleAPIError as e:
             failures.append(SyncFailure(event_id=ev.id, reason=str(e)))

@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
+from dateutil import parser as dateutil_parser
 from google.auth.transport.requests import Request as GoogleRequest  # noqa: F401
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -222,6 +224,149 @@ async def delete_event(
             status = e.details.get("status")
             if status in (404, 410):
                 logger.info("Event %s already gone from Google", google_event_id)
+                return
+            raise
+
+    await loop.run_in_executor(None, _delete)
+
+
+def _same_instant(iso_a: str, dt_b: datetime) -> bool:
+    """True if `iso_a` (RFC3339 from Google) and `dt_b` represent the same instant."""
+    try:
+        dt_a = dateutil_parser.isoparse(iso_a)
+    except (TypeError, ValueError):
+        return False
+    if dt_a.tzinfo is None or dt_b.tzinfo is None:
+        return False
+    return dt_a == dt_b
+
+
+async def _find_instance_id(
+    service: Any,
+    calendar_id: str,
+    master_event_id: str,
+    occurrence_start: datetime,
+) -> Optional[str]:
+    """Look up the Google `events.instances` id for a specific occurrence.
+
+    Queries a narrow window around `occurrence_start` and matches on
+    `originalStartTime`. Returns None if no occurrence is found.
+    """
+    if occurrence_start.tzinfo is None:
+        raise ValueError("occurrence_start must be timezone-aware")
+
+    loop = asyncio.get_event_loop()
+    # 1-second window each side is enough — Google won't have multiple
+    # occurrences at exactly the same start.
+    window_start = occurrence_start - timedelta(seconds=1)
+    window_end = occurrence_start + timedelta(seconds=1)
+
+    def _list() -> Dict[str, Any]:
+        return _execute_with_retry(
+            service.events().instances(
+                calendarId=calendar_id,
+                eventId=master_event_id,
+                timeMin=window_start.isoformat(),
+                timeMax=window_end.isoformat(),
+            )
+        )
+
+    try:
+        listing = await loop.run_in_executor(None, _list)
+    except GoogleAPIError as e:
+        # 404 on the master means it's gone; nothing to update/delete.
+        status = e.details.get("status")
+        if status in (404, 410):
+            return None
+        raise
+
+    for item in listing.get("items", []):
+        orig = item.get("originalStartTime") or {}
+        if "dateTime" in orig and _same_instant(orig["dateTime"], occurrence_start):
+            return item["id"]
+        if "date" in orig and orig["date"] == occurrence_start.date().isoformat():
+            return item["id"]
+
+    # If the window narrowed it to exactly one instance, trust it.
+    items = listing.get("items", [])
+    if len(items) == 1:
+        return items[0]["id"]
+    return None
+
+
+async def update_recurring_instance(
+    service: Any,
+    calendar_id: str,
+    master_google_event_id: str,
+    occurrence_start: datetime,
+    event: Event,
+    default_timezone: Optional[str] = None,
+) -> None:
+    """Update a single occurrence of a recurring event on Google Calendar.
+
+    The instance becomes an exception; other occurrences in the series are
+    unaffected. `event` carries the new fields (start/end/title/etc.).
+    """
+    settings = get_settings()
+    tz = default_timezone or settings.DEFAULT_TIMEZONE
+    body = event_to_google_body(event, tz)
+    # An instance update must not carry a recurrence rule.
+    body.pop("recurrence", None)
+
+    instance_id = await _find_instance_id(
+        service, calendar_id, master_google_event_id, occurrence_start
+    )
+    if instance_id is None:
+        raise GoogleAPIError(
+            f"No occurrence at {occurrence_start.isoformat()} on Google for "
+            f"event {master_google_event_id}",
+            details={"status": 404},
+        )
+
+    loop = asyncio.get_event_loop()
+
+    def _update() -> Dict[str, Any]:
+        return _execute_with_retry(
+            service.events().update(
+                calendarId=calendar_id,
+                eventId=instance_id,
+                body=body,
+            )
+        )
+
+    await loop.run_in_executor(None, _update)
+
+
+async def delete_recurring_instance(
+    service: Any,
+    calendar_id: str,
+    master_google_event_id: str,
+    occurrence_start: datetime,
+) -> None:
+    """Delete a single occurrence of a recurring event (best-effort)."""
+    instance_id = await _find_instance_id(
+        service, calendar_id, master_google_event_id, occurrence_start
+    )
+    if instance_id is None:
+        logger.info(
+            "Occurrence at %s for %s already absent from Google",
+            occurrence_start.isoformat(),
+            master_google_event_id,
+        )
+        return
+
+    loop = asyncio.get_event_loop()
+
+    def _delete() -> None:
+        try:
+            _execute_with_retry(
+                service.events().delete(
+                    calendarId=calendar_id, eventId=instance_id
+                )
+            )
+        except GoogleAPIError as e:
+            status = e.details.get("status")
+            if status in (404, 410):
                 return
             raise
 

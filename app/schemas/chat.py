@@ -1,9 +1,10 @@
 """Chat-related Pydantic schemas for the AI study/scheduling assistant."""
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -59,8 +60,40 @@ class ChatProposedEvent(BaseModel):
     end_datetime: Optional[datetime] = None
     event_type: str
     description: Optional[str] = None
+    is_all_day: bool = False
+    recurrence_rule: Optional[str] = None
+    syllabus_id: Optional[uuid.UUID] = None
+
+
+class ChatProposedUpdate(BaseModel):
+    """An edit the assistant proposes for an existing event.
+
+    The frontend sends `patch` verbatim as the body of
+    `PATCH /events/{event_id}?apply_to_series=...` when the user accepts.
+    """
+
+    proposal_id: str
+    # Plain UUID for one-off events; composite "<master_uuid>:<occurrence_iso>"
+    # for a single occurrence of a recurring series.
+    event_id: str
+    apply_to_series: bool = False
+    patch: Dict[str, Any]
+    # One-line summary the assistant generates for the tray card header,
+    # e.g. "Move 'CS 161 study' from 4pm to 5pm".
+    summary: Optional[str] = None
+
+
+class ChatProposedDelete(BaseModel):
+    """A deletion the assistant proposes for an existing event."""
+
+    proposal_id: str
+    event_id: str
+    apply_to_series: bool = False
+    summary: Optional[str] = None
 
 
 class ChatSendResponse(BaseModel):
     message: ChatMessage
     proposed_events: Optional[List[ChatProposedEvent]] = None
+    proposed_updates: Optional[List[ChatProposedUpdate]] = None
+    proposed_deletes: Optional[List[ChatProposedDelete]] = None

@@ -16,7 +16,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -82,6 +82,23 @@ class Event(Base):
     )
     is_all_day: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     recurrence_rule: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # ISO 8601 datetime strings of occurrences that have been deleted or
+    # individually overridden. Only meaningful when recurrence_rule is set.
+    exdates: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    # When this row is a per-instance override of a recurring master, points
+    # back to the master event and records the original (un-overridden)
+    # occurrence start. The master also carries that occurrence in `exdates`.
+    override_of_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("events.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
+    override_original_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # values_callable forces SQLAlchemy to send the enum *values* (lowercase)
     # rather than the *names* (uppercase). The PG enum types were created with
     # the lowercase values, so without this we'd hit
