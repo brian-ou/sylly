@@ -58,6 +58,8 @@ from sqlalchemy.pool import StaticPool  # noqa: E402
 from app.database import Base  # noqa: E402
 from app.models import event as _event_module  # noqa: E402,F401
 from app.models import grade_category as _grade_category_module  # noqa: E402,F401
+from app.models import study_attempt as _study_attempt_module  # noqa: E402,F401
+from app.models import study_concept as _study_concept_module  # noqa: E402,F401
 from app.models import syllabus as _syllabus_module  # noqa: E402,F401
 from app.models import user as _user_module  # noqa: E402,F401
 

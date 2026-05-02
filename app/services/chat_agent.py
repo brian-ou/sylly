@@ -22,6 +22,7 @@ from sqlalchemy.orm import selectinload
 from app.config import get_settings
 from app.exceptions import ClaudeParseError
 from app.models.event import Event, EventType
+from app.models.study_concept import StudyConcept
 from app.models.syllabus import Syllabus
 from app.models.user import User
 from app.schemas.chat import (
@@ -55,10 +56,20 @@ def _format_event_line(ev: Event, syllabus_label: Optional[str]) -> str:
     )
 
 
+def _format_concept_line(c: StudyConcept, syllabus_label: Optional[str]) -> str:
+    mastery = float(c.mastery_score or 0)
+    label = syllabus_label or "(no course)"
+    return (
+        f"- {c.title} | mastery={mastery:.2f} "
+        f"| seen={c.times_seen} correct={c.times_correct} | course={label}"
+    )
+
+
 def _build_system_prompt(
     user: User,
     upcoming_events: List[Event],
     syllabi: List[Syllabus],
+    study_concepts: List[StudyConcept],
 ) -> str:
     """Assemble the system prompt with the user's schedule + course context."""
     syllabus_by_id = {s.id: s for s in syllabi}
@@ -91,11 +102,39 @@ def _build_system_prompt(
         if ev.event_type == EventType.EXAM:
             exam_lines.append(_format_event_line(ev, syllabus_label))
 
+    # Show the weakest 8 concepts so the assistant knows where to push active
+    # recall, plus a count of mastered ones so it can celebrate progress.
+    sorted_concepts = sorted(
+        study_concepts, key=lambda c: float(c.mastery_score or 0)
+    )
+    weak_concepts = sorted_concepts[:8]
+    mastered_count = sum(
+        1 for c in study_concepts if float(c.mastery_score or 0) >= 0.8
+    )
+    weak_concept_lines: List[str] = []
+    for c in weak_concepts:
+        sl: Optional[str] = None
+        if c.syllabus_id and c.syllabus_id in syllabus_by_id:
+            s = syllabus_by_id[c.syllabus_id]
+            sl = s.course_code or s.course_name
+        weak_concept_lines.append(_format_concept_line(c, sl))
+
     courses_block = "\n".join(course_lines) if course_lines else "(none on file)"
     upcoming_block = (
         "\n".join(upcoming_lines) if upcoming_lines else "(no upcoming events)"
     )
     exams_block = "\n".join(exam_lines) if exam_lines else "(no upcoming exams)"
+    if study_concepts:
+        study_block = (
+            f"Total concepts: {len(study_concepts)} | mastered (>=0.80): "
+            f"{mastered_count}\nWeakest concepts to focus on:\n"
+            + ("\n".join(weak_concept_lines) if weak_concept_lines else "(none)")
+        )
+    else:
+        study_block = (
+            "(no study concepts yet — invite the student to paste course "
+            "material into the study tool to start active recall)"
+        )
 
     settings = get_settings()
     default_tz = settings.DEFAULT_TIMEZONE or "America/Los_Angeles"
@@ -113,6 +152,14 @@ The student's upcoming events (next ~30):
 Upcoming exams specifically (factor exam proximity into study suggestions — \
 weight closer exams more, and prioritize study sessions ahead of them):
 {exams_block}
+
+The student's study-tool progress (active recall the backend already tracks):
+{study_block}
+
+When weak concepts exist for an upcoming exam, prefer quizzing on those over \
+inventing new material. Reference the concept by name. The student can also \
+paste new course material into the study tool — suggest that when they ask \
+"how do I study X" and there are no concepts on file for X.
 
 You can do TWO things:
 
@@ -160,9 +207,9 @@ async def _fetch_context(
     user: User,
     context: Optional[ChatContext],
     db: AsyncSession,
-) -> Tuple[List[Event], List[Syllabus]]:
-    """Load the events overlapping the visible range (or next 30 days) and
-    all of the user's syllabi with their grade categories.
+) -> Tuple[List[Event], List[Syllabus], List[StudyConcept]]:
+    """Load the events overlapping the visible range (or next 30 days),
+    the user's syllabi with grade categories, and their study concepts.
     """
     if context and context.visible_range:
         range_start = context.visible_range.start
@@ -197,7 +244,17 @@ async def _fetch_context(
     )
     syllabi = list((await db.execute(syllabi_stmt)).scalars().all())
 
-    return events, syllabi
+    # Cap at 60: enough to summarize even a heavy study set without bloating
+    # the system prompt. The agent only renders the weakest 8 anyway.
+    concepts_stmt = (
+        select(StudyConcept)
+        .where(StudyConcept.user_id == user.id)
+        .order_by(StudyConcept.mastery_score.asc())
+        .limit(60)
+    )
+    study_concepts = list((await db.execute(concepts_stmt)).scalars().all())
+
+    return events, syllabi, study_concepts
 
 
 def _to_anthropic_messages(messages: List[ChatMessage]) -> List[dict]:
@@ -289,8 +346,12 @@ async def chat_plan(
     settings = get_settings()
     client = _build_client()
 
-    upcoming_events, syllabi = await _fetch_context(user, context, db)
-    system_prompt = _build_system_prompt(user, upcoming_events, syllabi)
+    upcoming_events, syllabi, study_concepts = await _fetch_context(
+        user, context, db
+    )
+    system_prompt = _build_system_prompt(
+        user, upcoming_events, syllabi, study_concepts
+    )
     api_messages = _to_anthropic_messages(messages)
 
     if not api_messages:

@@ -19,7 +19,16 @@ class Settings(BaseSettings):
 
     # Anthropic
     ANTHROPIC_API_KEY: str
+    # Conversational chat agent. Stays on a slightly stronger default since it
+    # has to juggle calendar context and tutoring tone.
     ANTHROPIC_MODEL: str = "claude-haiku-4-5"
+    # Parsing-class workloads: PDF text extraction, study concept extraction,
+    # quiz generation, grading. These are bounded JSON tasks where Haiku 4.5's
+    # speed/cost beats anything bigger.
+    ANTHROPIC_PARSE_MODEL: str = "claude-haiku-4-5"
+    # Below this character count, fall back to sending the raw PDF instead of
+    # extracted text — the PDF probably is image-based and pypdf got nothing.
+    PARSE_TEXT_MIN_CHARS: int = 400
 
     # Google OAuth
     GOOGLE_CLIENT_ID: str

@@ -1,14 +1,29 @@
-"""Claude-based PDF syllabus parser."""
+"""Claude-based syllabus parser.
+
+Two paths into the model:
+
+1. **Text-first** — pull text out of the PDF locally with pypdf and send only
+   that. Drops input tokens by an order of magnitude on a normal text-based
+   syllabus and lets us use the cheaper/faster ANTHROPIC_PARSE_MODEL.
+2. **PDF fallback** — when text extraction yields too little (image-only PDFs,
+   scans), fall back to base64 PDF document upload.
+
+The output schema and `_strip_code_fences` post-processing are unchanged from
+the previous version, so callers and tests don't need to know which path ran.
+"""
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import time
 from datetime import date
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from anthropic import Anthropic
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 
 from app.config import get_settings
 from app.exceptions import ClaudeParseError
@@ -16,60 +31,48 @@ from app.schemas.syllabus import ParsedSyllabus
 
 logger = logging.getLogger(__name__)
 
+# Compact system prompt — the previous one repeated the no-fences/no-preamble
+# rule across multiple sentences. Same intent, ~half the tokens.
 SYSTEM_PROMPT = (
-    "You extract dated academic events AND the grading scheme from course "
-    "syllabi. You return ONLY valid JSON matching the schema provided — no "
-    "preamble, no markdown fences, no explanation. If a field is unknown, "
-    "use null. If you are uncertain about a date, set confidence to \"low\"."
+    "Extract dated academic events and the grading scheme from a syllabus. "
+    "Return ONLY valid JSON matching the supplied schema. Use null for "
+    "unknowns; confidence \"low\" for ambiguous dates."
 )
 
-OUTPUT_SCHEMA = """{
-  "course_name": "string or null",
-  "course_code": "string or null",
-  "term": "string or null",
-  "timezone": "IANA timezone string or null",
-  "events": [
-    {
-      "title": "string",
-      "description": "string or null",
-      "start_datetime": "ISO 8601 string",
-      "end_datetime": "ISO 8601 string or null",
-      "is_all_day": true,
-      "recurrence_rule": "RRULE string or null",
-      "event_type": "assignment|exam|lecture|holiday|office_hours|other",
-      "confidence": "high|medium|low"
-    }
-  ],
-  "grade_categories": [
-    {
-      "name": "string (e.g. Homework, Midterm, Final, Participation)",
-      "weight": "number 0-100 (percentage points)",
-      "drop_lowest": "integer >= 0 (how many of the lowest scores are dropped, 0 if none)",
-      "notes": "string or null (any extra rule, e.g. 'must pass final to pass course')"
-    }
-  ]
-}"""
+# Single-line schema — Claude does not need pretty-printed JSON, and the saved
+# tokens add up across runs. Field semantics are explained in EXTRACTION_RULES
+# right below so we don't pay the schema-comment tax twice.
+OUTPUT_SCHEMA = (
+    '{"course_name":string|null,"course_code":string|null,"term":string|null,'
+    '"timezone":string|null,'
+    '"events":[{"title":string,"description":string|null,'
+    '"start_datetime":ISO8601,"end_datetime":ISO8601|null,'
+    '"is_all_day":bool,"recurrence_rule":RRULE|null,'
+    '"event_type":"assignment|exam|lecture|holiday|office_hours|other",'
+    '"confidence":"high|medium|low"}],'
+    '"grade_categories":[{"name":string,"weight":0-100,'
+    '"drop_lowest":int>=0,"notes":string|null}]}'
+)
 
-EXTRACTION_INSTRUCTIONS = """Extraction instructions:
-- Identify course name, course code, and term.
-- Extract every dated item: lectures, assignments, readings, exams, project milestones, holidays, office hours, drop deadlines.
-- For recurring events (e.g. "MWF lectures Aug 26 - Dec 5"), output ONE event with a recurrence_rule in RFC 5545 RRULE format, not many individual events.
-- IMPORTANT: For regularly scheduled class meetings (lectures, sections, labs, recitations), output ONE recurring event per pattern even when the syllabus lists each session's topic separately. Use a generic title like "Lecture", "Section", or "Lab" — do NOT create one event per session for each weekly topic. Per-session topics belong in a syllabus, not on a calendar. This rule does not apply to exams, assignments, or one-off events, which should still be listed individually.
-- For events without an explicit year, infer it from the term/syllabus header.
-- Use ISO 8601 for dates and times. Use the syllabus's stated timezone if given, otherwise leave as a naive datetime and the backend will assume America/Los_Angeles.
-- Set is_all_day: true for assignments without a specific time.
-- Use these event_type values exactly: assignment, exam, lecture, holiday, office_hours, other.
-- Set confidence: "low" when the date is ambiguous, the year is inferred, or the time is unclear.
-- Look for a "Grading", "Evaluation", "Assessment", or "Course policies" section
-  and emit one entry per weighted bucket in `grade_categories`. Use the
-  syllabus's own labels (e.g. "Homework", "Problem Sets", "Midterm",
-  "Final Exam", "Participation"). Express weight as a number in 0-100; a
-  syllabus that says "30%" becomes weight: 30. If the syllabus mentions
-  dropping the lowest N scores in a bucket, set drop_lowest to N. Put any
-  qualifying language (e.g. "must pass exam to pass course") in notes.
-- If no grading scheme is present, return an empty array — do NOT invent
-  weights.
-"""
+EXTRACTION_RULES = (
+    "Rules:\n"
+    "- Extract every dated item: lectures, assignments, readings, exams, "
+    "milestones, holidays, office hours, drop deadlines.\n"
+    "- Recurring meetings (e.g. MWF lectures) → ONE event with an RFC 5545 "
+    "RRULE. Generic title (\"Lecture\", \"Section\"); per-session topics "
+    "belong in a syllabus, not the calendar. Exams and one-offs stay "
+    "individual.\n"
+    "- Infer year from term/header when missing. ISO 8601 datetimes; naive "
+    "OK (backend assumes America/Los_Angeles).\n"
+    "- is_all_day:true for assignments without a specific time.\n"
+    "- event_type values exactly: assignment|exam|lecture|holiday|"
+    "office_hours|other.\n"
+    "- confidence:\"low\" when date is ambiguous or year inferred.\n"
+    "- grade_categories: one entry per weighted bucket (Homework, Midterm, "
+    "Final, Participation, etc.). weight is 0-100 (a syllabus's \"30%\" "
+    "becomes 30). drop_lowest: N if syllabus drops N. notes: any qualifier "
+    "(e.g. \"must pass final\"). If no scheme: empty array — do NOT invent."
+)
 
 
 def _build_client() -> Anthropic:
@@ -81,13 +84,76 @@ def _strip_code_fences(text: str) -> str:
     """Remove markdown code fences if Claude returned them despite instructions."""
     text = text.strip()
     if text.startswith("```"):
-        # remove opening fence (possibly ```json)
         first_newline = text.find("\n")
         if first_newline != -1:
             text = text[first_newline + 1 :]
         if text.endswith("```"):
             text = text[:-3]
     return text.strip()
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    """Pull plain text from a PDF using pypdf. Empty string on failure.
+
+    Joins pages with a `\n\n--- page N ---\n` separator so date lookups can
+    still anchor on page boundaries (some syllabi date-stamp by section).
+    """
+    try:
+        reader = PdfReader(stream=io.BytesIO(pdf_bytes))
+    except PdfReadError as e:
+        logger.warning("pypdf could not open PDF for text extraction: %s", e)
+        return ""
+    except Exception as e:  # noqa: BLE001 - pypdf is noisy on weird files
+        logger.warning("pypdf raised on text extraction: %s", e)
+        return ""
+
+    chunks: List[str] = []
+    for i, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Skipping page %s: extract_text failed: %s", i, e)
+            continue
+        text = text.strip()
+        if text:
+            chunks.append(f"--- page {i} ---\n{text}")
+    return "\n\n".join(chunks)
+
+
+def _build_text_messages(text: str, hints: str, instructions: str) -> List[dict]:
+    """Single user turn carrying syllabus text + hints + instructions."""
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": hints},
+                {"type": "text", "text": instructions},
+                {"type": "text", "text": f"--- syllabus text ---\n{text}"},
+            ],
+        }
+    ]
+
+
+def _build_pdf_messages(pdf_bytes: bytes, hints: str, instructions: str) -> List[dict]:
+    """Fallback path: send the PDF as a base64 document block."""
+    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+    return [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": pdf_b64,
+                    },
+                },
+                {"type": "text", "text": hints},
+                {"type": "text", "text": instructions},
+            ],
+        }
+    ]
 
 
 def parse_syllabus_pdf(
@@ -97,7 +163,11 @@ def parse_syllabus_pdf(
     today: Optional[date] = None,
     client: Optional[Anthropic] = None,
 ) -> ParsedSyllabus:
-    """Send a PDF to Claude and return a validated ParsedSyllabus.
+    """Parse a syllabus PDF into a validated ParsedSyllabus.
+
+    Tries local text extraction first (cheap + fast). Falls back to sending
+    the PDF document if pypdf yields fewer than `PARSE_TEXT_MIN_CHARS` chars
+    (i.e. the PDF is image-based or pypdf failed).
 
     Args:
         pdf_bytes: Raw PDF bytes.
@@ -110,8 +180,6 @@ def parse_syllabus_pdf(
     client = client or _build_client()
     today = today or date.today()
 
-    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
-
     hints_text = f"Today's date is {today.isoformat()}."
     if course_hint:
         hints_text += f" Course hint: {course_hint}."
@@ -119,36 +187,30 @@ def parse_syllabus_pdf(
         hints_text += f" Term hint: {term_hint}."
 
     instructions_text = (
-        f"{EXTRACTION_INSTRUCTIONS}\n\n"
-        f"Output schema (return JSON matching this exactly):\n{OUTPUT_SCHEMA}"
+        f"{EXTRACTION_RULES}\n\nOutput schema (return JSON exactly matching):"
+        f"\n{OUTPUT_SCHEMA}"
     )
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": pdf_b64,
-                    },
-                },
-                {"type": "text", "text": hints_text},
-                {"type": "text", "text": instructions_text},
-            ],
-        }
-    ]
+    text = _extract_pdf_text(pdf_bytes)
+    if len(text) >= settings.PARSE_TEXT_MIN_CHARS:
+        messages = _build_text_messages(text, hints_text, instructions_text)
+        path = "text"
+    else:
+        if text:
+            logger.info(
+                "Extracted only %s chars; falling back to PDF document upload",
+                len(text),
+            )
+        messages = _build_pdf_messages(pdf_bytes, hints_text, instructions_text)
+        path = "pdf"
 
     started = time.monotonic()
     try:
         response = client.messages.create(
-            model=settings.ANTHROPIC_MODEL,
-            # Long syllabi (e.g., a full semester of dated readings + assignments
-            # + recurring lectures + exams) can easily exceed 4K output tokens.
-            # 8192 is supported by all current Sonnet and Opus models without
-            # any extended-output beta header.
+            model=settings.ANTHROPIC_PARSE_MODEL,
+            # Long syllabi (full semester of dated readings + assignments +
+            # recurring lectures + exams) can exceed 4K output tokens. 8192 is
+            # supported by Haiku 4.5 / Sonnet / Opus without any beta header.
             max_tokens=8192,
             system=SYSTEM_PROMPT,
             messages=messages,
@@ -158,14 +220,15 @@ def parse_syllabus_pdf(
         raise ClaudeParseError(f"Anthropic API call failed: {e}") from e
     latency_ms = int((time.monotonic() - started) * 1000)
 
-    # Log usage but never the content
     try:
         usage = getattr(response, "usage", None)
         in_tokens = getattr(usage, "input_tokens", None)
         out_tokens = getattr(usage, "output_tokens", None)
         logger.info(
-            "Claude parse model=%s input_tokens=%s output_tokens=%s latency_ms=%s",
-            settings.ANTHROPIC_MODEL,
+            "Claude parse model=%s path=%s input_tokens=%s output_tokens=%s "
+            "latency_ms=%s",
+            settings.ANTHROPIC_PARSE_MODEL,
+            path,
             in_tokens,
             out_tokens,
             latency_ms,

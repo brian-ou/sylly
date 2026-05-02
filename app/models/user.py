@@ -14,6 +14,7 @@ from app.database import Base
 if TYPE_CHECKING:
     from app.models.syllabus import Syllabus
     from app.models.event import Event
+    from app.models.study_concept import StudyConcept
 
 
 class User(Base):
@@ -53,4 +54,7 @@ class User(Base):
     )
     events: Mapped[List["Event"]] = relationship(
         "Event", back_populates="user", cascade="all, delete-orphan"
+    )
+    study_concepts: Mapped[List["StudyConcept"]] = relationship(
+        "StudyConcept", back_populates="user", cascade="all, delete-orphan"
     )

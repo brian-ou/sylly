@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from app.models.user import User
     from app.models.event import Event
     from app.models.grade_category import GradeCategory
+    from app.models.study_concept import StudyConcept
 
 
 class Syllabus(Base):
@@ -60,4 +61,9 @@ class Syllabus(Base):
         back_populates="syllabus",
         cascade="all, delete-orphan",
         order_by="GradeCategory.sort_order, GradeCategory.name",
+    )
+    # Study concepts use ON DELETE SET NULL — see study_concept.py for the
+    # rationale (pasted material outlives the syllabus that inspired it).
+    study_concepts: Mapped[List["StudyConcept"]] = relationship(
+        "StudyConcept", back_populates="syllabus"
     )

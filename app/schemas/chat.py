@@ -16,12 +16,18 @@ class ChatRole(str, Enum):
 
 
 class ChatMessage(BaseModel):
-    """A single chat turn. `pending` is a UI-only flag and ignored server-side."""
+    """A single chat turn.
 
-    id: str
+    On the wire `id` and `created_at` are optional so the frontend can post a
+    minimal `{role, content}` for inbound messages — the agent only reads
+    role/content anyway, and stamps a fresh id + timestamp on the assistant
+    reply it returns. `pending` is a UI-only flag and ignored server-side.
+    """
+
+    id: Optional[str] = None
     role: ChatRole
     content: str
-    created_at: str
+    created_at: Optional[str] = None
     pending: Optional[bool] = None
 
 
