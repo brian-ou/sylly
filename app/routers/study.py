@@ -1,21 +1,27 @@
 """Study tool routes: ingest material, run quiz cycles, view progress."""
 from __future__ import annotations
 
+import io
 import logging
 import random
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, Form, UploadFile
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import get_db
 from app.deps import get_current_user
 from app.exceptions import (
+    ClaudeParseError,
     InvalidInputError,
     NotFoundError,
+    PDFTooLargeError,
     RateLimitExceededError,
 )
 from app.models.event import Event, EventType
@@ -23,17 +29,21 @@ from app.models.study_attempt import StudyAttempt
 from app.models.study_concept import StudyConcept
 from app.models.syllabus import Syllabus
 from app.models.user import User
+from app.schemas.chat import ChatMessage, ChatRole
 from app.schemas.study import (
     QuizGradeRequest,
     QuizGradeResponse,
     QuizNextRequest,
     QuizQuestion,
+    StudyChatRequest,
+    StudyChatResponse,
     StudyConceptRead,
     StudyMaterialIngestRequest,
     StudyMaterialIngestResponse,
     StudyProgressBucket,
     StudyProgressResponse,
 )
+from app.services.claude_parser import extract_pdf_text
 from app.services.rate_limit import SlidingWindowRateLimiter
 from app.services.study_agent import (
     CORRECT_THRESHOLD,
@@ -41,6 +51,7 @@ from app.services.study_agent import (
     extract_concepts,
     generate_question,
     grade_answer,
+    study_chat,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +64,9 @@ router = APIRouter(tags=["study"])
 study_ingest_limiter = SlidingWindowRateLimiter(limit=20, window_seconds=3600)
 # Quiz cycle (next + grade) is per-call cheap; allow a real study session.
 study_quiz_limiter = SlidingWindowRateLimiter(limit=240, window_seconds=3600)
+# Tutor chat: matches the general chat limit so a long study session isn't
+# arbitrarily cut off.
+study_chat_limiter = SlidingWindowRateLimiter(limit=120, window_seconds=3600)
 
 
 def _to_read(concept: StudyConcept) -> StudyConceptRead:
@@ -94,6 +108,46 @@ async def _own_concept_or_404(
     return c
 
 
+async def _persist_extracted_concepts(
+    user: User,
+    db: AsyncSession,
+    syllabus_id: Optional[uuid.UUID],
+    material: str,
+    max_concepts: int,
+) -> List[StudyConcept]:
+    """Run extract_concepts + dedupe + persist. Shared by JSON + PDF ingest."""
+    extracted = extract_concepts(material=material, max_concepts=max_concepts)
+    if not extracted:
+        return []
+
+    existing_stmt = select(StudyConcept).where(
+        StudyConcept.user_id == user.id,
+        StudyConcept.syllabus_id == syllabus_id,
+    )
+    existing = list((await db.execute(existing_stmt)).scalars().all())
+    existing_titles = {c.title.lower() for c in existing}
+
+    saved: List[StudyConcept] = []
+    for ec in extracted:
+        if ec.title.lower() in existing_titles:
+            continue
+        existing_titles.add(ec.title.lower())
+        concept = StudyConcept(
+            user_id=user.id,
+            syllabus_id=syllabus_id,
+            title=ec.title,
+            summary=ec.summary,
+            source_text=material[:8000],
+        )
+        db.add(concept)
+        saved.append(concept)
+
+    await db.commit()
+    for c in saved:
+        await db.refresh(c)
+    return saved
+
+
 @router.post(
     "/study/material",
     response_model=StudyMaterialIngestResponse,
@@ -116,42 +170,84 @@ async def ingest_material(
     if body.syllabus_id is not None:
         await _own_syllabus_or_404(body.syllabus_id, current_user, db)
 
-    extracted = extract_concepts(
-        material=body.material, max_concepts=body.max_concepts
+    saved = await _persist_extracted_concepts(
+        user=current_user,
+        db=db,
+        syllabus_id=body.syllabus_id,
+        material=body.material,
+        max_concepts=body.max_concepts,
     )
-    if not extracted:
-        return StudyMaterialIngestResponse(
-            syllabus_id=body.syllabus_id, concepts=[]
-        )
-
-    existing_stmt = select(StudyConcept).where(
-        StudyConcept.user_id == current_user.id,
-        StudyConcept.syllabus_id == body.syllabus_id,
-    )
-    existing = list((await db.execute(existing_stmt)).scalars().all())
-    existing_titles = {c.title.lower() for c in existing}
-
-    saved: List[StudyConcept] = []
-    for ec in extracted:
-        if ec.title.lower() in existing_titles:
-            continue
-        existing_titles.add(ec.title.lower())
-        concept = StudyConcept(
-            user_id=current_user.id,
-            syllabus_id=body.syllabus_id,
-            title=ec.title,
-            summary=ec.summary,
-            source_text=body.material[:8000],
-        )
-        db.add(concept)
-        saved.append(concept)
-
-    await db.commit()
-    for c in saved:
-        await db.refresh(c)
-
     return StudyMaterialIngestResponse(
         syllabus_id=body.syllabus_id,
+        concepts=[_to_read(c) for c in saved],
+    )
+
+
+@router.post(
+    "/study/material/pdf",
+    response_model=StudyMaterialIngestResponse,
+    summary="Upload a PDF (notes, chapter, slides) and extract study concepts",
+)
+async def ingest_material_pdf(
+    file: UploadFile = File(..., description="PDF (<=20MB, <=100 pages)"),
+    syllabus_id: Optional[uuid.UUID] = Form(default=None),
+    max_concepts: int = Form(default=12, ge=1, le=40),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> StudyMaterialIngestResponse:
+    """Same as `/study/material` but accepts a PDF.
+
+    Text is extracted locally with pypdf (no model call needed for the
+    extraction step), then run through the same concept extractor. Image-only
+    PDFs that yield no text are rejected with a clear error rather than
+    silently sending the whole binary to the model.
+    """
+    settings = get_settings()
+
+    if not study_ingest_limiter.check(str(current_user.id)):
+        raise RateLimitExceededError("Limit is 20 study ingests per hour")
+
+    if file.content_type != "application/pdf":
+        raise InvalidInputError("File must be application/pdf")
+
+    if syllabus_id is not None:
+        await _own_syllabus_or_404(syllabus_id, current_user, db)
+
+    pdf_bytes = await file.read()
+    if len(pdf_bytes) > settings.MAX_PDF_BYTES:
+        raise PDFTooLargeError(
+            f"PDF exceeds maximum size of {settings.MAX_PDF_BYTES} bytes"
+        )
+
+    try:
+        reader = PdfReader(stream=io.BytesIO(pdf_bytes))
+        page_count = len(reader.pages)
+    except PdfReadError as e:
+        raise InvalidInputError(f"Could not read PDF: {e}") from e
+    except Exception as e:  # pypdf can raise non-PdfReadError on weird files
+        raise InvalidInputError(f"Could not read PDF: {e}") from e
+
+    if page_count > settings.MAX_PDF_PAGES:
+        raise PDFTooLargeError(
+            f"PDF has {page_count} pages; max is {settings.MAX_PDF_PAGES}"
+        )
+
+    text = extract_pdf_text(pdf_bytes)
+    if len(text) < settings.PARSE_TEXT_MIN_CHARS:
+        raise InvalidInputError(
+            "Couldn't extract enough text from the PDF — it may be scanned or "
+            "image-based. Try pasting the text in directly."
+        )
+
+    saved = await _persist_extracted_concepts(
+        user=current_user,
+        db=db,
+        syllabus_id=syllabus_id,
+        material=text,
+        max_concepts=max_concepts,
+    )
+    return StudyMaterialIngestResponse(
+        syllabus_id=syllabus_id,
         concepts=[_to_read(c) for c in saved],
     )
 
@@ -429,3 +525,112 @@ async def study_progress(
 
     out.sort(key=_sort_key)
     return StudyProgressResponse(buckets=out)
+
+
+@router.post(
+    "/study/chat",
+    response_model=StudyChatResponse,
+    summary="Conversational study tutor with mastery tracking",
+)
+async def study_chat_endpoint(
+    body: StudyChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> StudyChatResponse:
+    """Run one Socratic-tutor turn against the user's study set.
+
+    The frontend re-sends the full conversation each turn (stateless server).
+    The tutor may emit `assessments` inline when the student demonstrates
+    clear understanding or a clear gap; each assessment is persisted as a
+    `study_attempts` row and updates the concept's mastery via the same EMA
+    used by the explicit grader. The updated concept rows come back in
+    `updated_concepts` so the UI can show the bump immediately.
+    """
+    if not study_chat_limiter.check(str(current_user.id)):
+        raise RateLimitExceededError("Limit is 120 study chat calls per hour")
+
+    if not body.messages:
+        raise InvalidInputError("messages must not be empty")
+    if body.messages[-1].role != ChatRole.USER:
+        raise InvalidInputError("last message must be from the user")
+
+    if body.syllabus_id is not None:
+        await _own_syllabus_or_404(body.syllabus_id, current_user, db)
+
+    focus_concept: Optional[StudyConcept] = None
+    if body.concept_id is not None:
+        focus_concept = await _own_concept_or_404(
+            body.concept_id, current_user, db
+        )
+
+    # Build the candidate pool: syllabus-scoped if provided, else everything
+    # the user has. Order by weakest first so the tutor sees gaps first.
+    pool_stmt = select(StudyConcept).where(StudyConcept.user_id == current_user.id)
+    if body.syllabus_id is not None:
+        pool_stmt = pool_stmt.where(StudyConcept.syllabus_id == body.syllabus_id)
+    pool_stmt = pool_stmt.order_by(StudyConcept.mastery_score.asc()).limit(40)
+    pool_concepts = list((await db.execute(pool_stmt)).scalars().all())
+
+    if not pool_concepts and focus_concept is None:
+        raise NotFoundError(
+            "No study concepts yet — paste material into /study/material first"
+        )
+
+    try:
+        message_text, assessments = study_chat(
+            messages=body.messages,
+            focus_concept=focus_concept,
+            pool_concepts=pool_concepts,
+        )
+    except ClaudeParseError:
+        raise
+
+    # Apply each assessment as a StudyAttempt + mastery update. We need the
+    # actual ORM rows for `apply_attempt_to_concept`, so build a quick lookup.
+    pool_by_id = {c.id: c for c in pool_concepts}
+    if focus_concept is not None:
+        pool_by_id[focus_concept.id] = focus_concept
+
+    updated: List[StudyConcept] = []
+    attempted_at = datetime.now(timezone.utc)
+    last_user_msg = body.messages[-1].content
+    for a in assessments:
+        concept = pool_by_id.get(a.concept_id)
+        if concept is None:
+            # Defense in depth: study_chat already filters unknown ids, but
+            # double-check before mutating state.
+            continue
+        attempt = StudyAttempt(
+            user_id=current_user.id,
+            concept_id=concept.id,
+            # `question` here is "the prompt that elicited the assessment" —
+            # we use the last user message as a stand-in since the tutor
+            # didn't pose a discrete question/answer pair.
+            question=last_user_msg[:2000],
+            user_answer=last_user_msg[:2000],
+            correct=a.score >= CORRECT_THRESHOLD,
+            score=round(a.score, 3),
+            feedback=a.note,
+            attempted_at=attempted_at,
+        )
+        db.add(attempt)
+        apply_attempt_to_concept(concept, a.score, attempted_at)
+        updated.append(concept)
+
+    if updated:
+        await db.commit()
+        for c in updated:
+            await db.refresh(c)
+
+    assistant_message = ChatMessage(
+        id=str(uuid.uuid4()),
+        role=ChatRole.ASSISTANT,
+        content=message_text,
+        created_at=attempted_at.isoformat(),
+        pending=None,
+    )
+    return StudyChatResponse(
+        message=assistant_message,
+        updated_concepts=[_to_read(c) for c in updated],
+        assessments=assessments,
+    )

@@ -20,8 +20,9 @@ import json
 import logging
 import re
 import time
+import uuid
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from anthropic import Anthropic
 
@@ -29,7 +30,8 @@ from app.config import get_settings
 from app.exceptions import ClaudeParseError
 from app.models.study_attempt import StudyAttempt
 from app.models.study_concept import StudyConcept
-from app.schemas.study import ExtractedConcept
+from app.schemas.chat import ChatMessage, ChatRole
+from app.schemas.study import ConceptAssessment, ExtractedConcept
 
 logger = logging.getLogger(__name__)
 
@@ -306,3 +308,196 @@ def apply_attempt_to_concept(
     if score >= CORRECT_THRESHOLD:
         concept.times_correct = (concept.times_correct or 0) + 1
     concept.last_attempted_at = attempted_at
+
+
+# ---------- Conversational study tutor ----------
+
+
+_TUTOR_RESPONSE_TAG_RE = re.compile(
+    r"<response>(.*?)</response>", re.DOTALL | re.IGNORECASE
+)
+
+_TUTOR_SYSTEM_BASE = (
+    "You are a study tutor for a college student. Help them learn through "
+    "Socratic dialogue — make THEM do the cognitive work, not you.\n\n"
+    "Rules:\n"
+    "- Ask questions; don't lecture. One focused question at a time.\n"
+    "- When the student is wrong: hint, don't reveal. Walk them toward the "
+    "answer with a smaller sub-question or a pointer to the right framework.\n"
+    "- When right: confirm specifically (which part was correct) and probe "
+    "deeper (why does that hold? when would it break?).\n"
+    "- Vary question style: define, explain why, compare, apply, predict.\n"
+    "- Reference concept titles by name when discussing them.\n"
+    "- Keep replies short — 2-4 sentences. The student should be doing more "
+    "typing than you.\n"
+    "- Stay focused on the chosen concepts. If asked off-topic, gently redirect.\n\n"
+    "MASTERY ASSESSMENTS: When the student has clearly demonstrated "
+    "understanding of a concept (correct + complete reasoning) OR clearly "
+    "shown a gap, emit one assessment for that concept. Score 0.8-1.0 for "
+    "clear mastery, 0.5-0.7 for partial, 0.0-0.3 for clear gap. Omit "
+    "assessments when uncertain (most turns). At most 1 assessment per turn.\n\n"
+    "OUTPUT RULE — respond in this exact format with the JSON wrapped in "
+    "<response>...</response> tags and nothing else outside the tags:\n\n"
+    "<response>\n"
+    "{\n"
+    '  "message": "your reply to the student (required, non-empty)",\n'
+    '  "assessments": [\n'
+    '    { "concept_id": "uuid string", "score": 0.0..1.0, "note": "1-line reason" }\n'
+    "  ]\n"
+    "}\n"
+    "</response>\n\n"
+    "`assessments` may be `[]` or omitted when no judgment is warranted."
+)
+
+
+def _format_concept_for_tutor(c: StudyConcept) -> str:
+    mastery = float(c.mastery_score or 0)
+    return (
+        f"- id={c.id} | {c.title} | mastery={mastery:.2f} "
+        f"| seen={c.times_seen}\n  summary: {c.summary}"
+    )
+
+
+def build_tutor_system_prompt(
+    focus_concept: Optional[StudyConcept],
+    pool_concepts: List[StudyConcept],
+) -> str:
+    """Assemble the tutor system prompt with concept context.
+
+    - `focus_concept`, if set, pins the dialogue to that concept and is
+      mentioned first.
+    - `pool_concepts` is the broader set the tutor may rotate across (already
+      filtered to syllabus scope by the caller). Capped to 12 to keep tokens
+      bounded.
+    """
+    if focus_concept is not None:
+        focus_block = (
+            "Focused concept (drive every question toward this one):\n"
+            f"{_format_concept_for_tutor(focus_concept)}"
+        )
+    else:
+        focus_block = "Focused concept: none — choose from the pool below."
+
+    capped = pool_concepts[:12]
+    if capped:
+        pool_block = "\n".join(_format_concept_for_tutor(c) for c in capped)
+    else:
+        pool_block = "(no concepts in scope)"
+
+    return (
+        f"{_TUTOR_SYSTEM_BASE}\n\n"
+        f"{focus_block}\n\n"
+        f"Available concepts in scope (use the id verbatim in any assessment):\n"
+        f"{pool_block}"
+    )
+
+
+def _to_anthropic_messages(messages: List[ChatMessage]) -> List[dict]:
+    out: List[dict] = []
+    for m in messages:
+        if m.role == ChatRole.SYSTEM:
+            continue
+        role = "user" if m.role == ChatRole.USER else "assistant"
+        out.append({"role": role, "content": m.content})
+    return out
+
+
+def _parse_tutor_envelope(
+    raw_text: str, valid_concept_ids: set[str]
+) -> Tuple[str, List[ConceptAssessment]]:
+    """Pull `message` + validated `assessments` out of the <response> envelope.
+
+    Falls back to plain-text message if the envelope is missing or malformed.
+    Drops any assessment whose concept_id isn't in the user's pool — the model
+    occasionally hallucinates ids despite being given them.
+    """
+    match = _TUTOR_RESPONSE_TAG_RE.search(raw_text)
+    if not match:
+        return raw_text.strip(), []
+
+    payload = match.group(1).strip()
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        logger.warning("Tutor response envelope was not valid JSON")
+        return raw_text.strip(), []
+
+    if not isinstance(data, dict):
+        return raw_text.strip(), []
+
+    message = data.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return raw_text.strip(), []
+
+    raw_assessments = data.get("assessments") or []
+    if not isinstance(raw_assessments, list):
+        raw_assessments = []
+
+    out: List[ConceptAssessment] = []
+    for ra in raw_assessments:
+        if not isinstance(ra, dict):
+            continue
+        concept_id_raw = ra.get("concept_id")
+        if not concept_id_raw or str(concept_id_raw) not in valid_concept_ids:
+            logger.warning(
+                "Tutor emitted assessment for unknown concept_id %s", concept_id_raw
+            )
+            continue
+        try:
+            assessment = ConceptAssessment(
+                concept_id=uuid.UUID(str(concept_id_raw)),
+                score=float(ra.get("score", 0)),
+                note=str(ra.get("note") or "").strip(),
+            )
+        except (ValueError, TypeError) as e:
+            logger.warning("Skipping malformed tutor assessment: %s", e)
+            continue
+        out.append(assessment)
+
+    return message.strip(), out
+
+
+def study_chat(
+    messages: List[ChatMessage],
+    focus_concept: Optional[StudyConcept],
+    pool_concepts: List[StudyConcept],
+    client: Optional[Anthropic] = None,
+) -> Tuple[str, List[ConceptAssessment]]:
+    """Run one tutor turn. Returns (assistant text, validated assessments).
+
+    The caller is responsible for persisting attempts and updating mastery —
+    this function only talks to the model and parses its envelope.
+    """
+    settings = get_settings()
+    client = client or _build_client()
+
+    system_prompt = build_tutor_system_prompt(focus_concept, pool_concepts)
+    api_messages = _to_anthropic_messages(messages)
+    if not api_messages:
+        raise ClaudeParseError("No messages to send to the tutor")
+
+    started = time.monotonic()
+    try:
+        response = client.messages.create(
+            model=settings.ANTHROPIC_MODEL,
+            max_tokens=1024,
+            system=system_prompt,
+            messages=api_messages,
+        )
+    except Exception as e:
+        logger.exception("Anthropic study-chat call failed")
+        raise ClaudeParseError(f"Study chat failed: {e}") from e
+    _log_usage(
+        "Study chat", settings.ANTHROPIC_MODEL, response,
+        int((time.monotonic() - started) * 1000),
+    )
+
+    raw_text = _model_text(response)
+    if not raw_text:
+        raise ClaudeParseError("Tutor returned an empty response")
+
+    valid_ids = {str(c.id) for c in pool_concepts}
+    if focus_concept is not None:
+        valid_ids.add(str(focus_concept.id))
+
+    return _parse_tutor_envelope(raw_text, valid_ids)

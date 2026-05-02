@@ -53,11 +53,11 @@ def test_text_extraction_skips_pdf_upload(monkeypatch):
     fixture_text = FIXTURE_PATH.read_text()
     client = _mock_client_with_text(fixture_text)
 
-    # Force `_extract_pdf_text` to return a long string so the parser takes
+    # Force `extract_pdf_text` to return a long string so the parser takes
     # the text-first path. This avoids needing to construct a PDF that
     # actually contains text content.
     monkeypatch.setattr(
-        "app.services.claude_parser._extract_pdf_text",
+        "app.services.claude_parser.extract_pdf_text",
         lambda _b: "FAKE EXTRACTED TEXT " * 100,
     )
 

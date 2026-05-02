@@ -18,7 +18,11 @@ from app.services.rate_limit import (
     chat_limiter,
     parse_limiter,
 )
-from app.routers.study import study_ingest_limiter, study_quiz_limiter
+from app.routers.study import (
+    study_chat_limiter,
+    study_ingest_limiter,
+    study_quiz_limiter,
+)
 
 
 def _auth_headers(user_id: uuid.UUID) -> dict:
@@ -31,6 +35,7 @@ def _reset_limits(user_id: uuid.UUID) -> None:
     chat_limiter.reset(key)
     study_ingest_limiter.reset(key)
     study_quiz_limiter.reset(key)
+    study_chat_limiter.reset(key)
 
 
 @pytest.mark.asyncio
@@ -218,3 +223,168 @@ async def test_progress_groups_by_syllabus(app_with_test_db, test_user, db_sessi
     assert cs["mastered_count"] == 1
     assert cs["struggling_count"] == 1
     assert cs["next_exam_at"] is not None
+
+
+# ---------- PDF ingest ----------
+
+
+@pytest.mark.asyncio
+async def test_ingest_pdf_extracts_concepts(app_with_test_db, test_user):
+    _reset_limits(test_user.id)
+    headers = _auth_headers(test_user.id)
+    extracted = [
+        ExtractedConcept(title="Diffusion", summary="Net movement down a gradient."),
+    ]
+    # Patch BOTH the text extractor (so we don't have to construct a PDF with
+    # real glyphs) and the concept extractor (to avoid a real model call).
+    with patch(
+        "app.routers.study.extract_pdf_text", return_value="x" * 600
+    ), patch("app.routers.study.extract_concepts", return_value=extracted):
+        # The PDF bytes still need to parse with pypdf so the size+page-count
+        # guards pass. Reuse the helper from test_syllabi_parse.
+        import io
+        from pypdf import PdfWriter
+
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        buf = io.BytesIO()
+        writer.write(buf)
+        pdf_bytes = buf.getvalue()
+
+        transport = ASGITransport(app=app_with_test_db)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            resp = await c.post(
+                "/study/material/pdf",
+                files={"file": ("notes.pdf", pdf_bytes, "application/pdf")},
+                headers=headers,
+            )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [c["title"] for c in body["concepts"]] == ["Diffusion"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_pdf_rejects_image_only_pdf(app_with_test_db, test_user):
+    """When pypdf yields too little text, return a clear 400 instead of
+    silently shipping a useless prompt to the model."""
+    _reset_limits(test_user.id)
+    headers = _auth_headers(test_user.id)
+    with patch("app.routers.study.extract_pdf_text", return_value=""):
+        import io
+        from pypdf import PdfWriter
+
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        buf = io.BytesIO()
+        writer.write(buf)
+        pdf_bytes = buf.getvalue()
+
+        transport = ASGITransport(app=app_with_test_db)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            resp = await c.post(
+                "/study/material/pdf",
+                files={"file": ("scan.pdf", pdf_bytes, "application/pdf")},
+                headers=headers,
+            )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "INVALID_INPUT"
+
+
+@pytest.mark.asyncio
+async def test_ingest_pdf_rejects_non_pdf(app_with_test_db, test_user):
+    _reset_limits(test_user.id)
+    headers = _auth_headers(test_user.id)
+    transport = ASGITransport(app=app_with_test_db)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/study/material/pdf",
+            files={"file": ("notes.txt", b"hello", "text/plain")},
+            headers=headers,
+        )
+    assert resp.status_code == 400
+
+
+# ---------- Study chat (tutor) ----------
+
+
+@pytest.mark.asyncio
+async def test_study_chat_persists_assessments_and_updates_mastery(
+    app_with_test_db, test_user, db_session
+):
+    _reset_limits(test_user.id)
+    concept = StudyConcept(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        title="Big-O notation",
+        summary="Asymptotic upper bound on growth.",
+        mastery_score=Decimal("0.300"),
+    )
+    db_session.add(concept)
+    await db_session.commit()
+
+    # study_chat() is patched to return a tutor reply + one high-score
+    # assessment. The router should persist a StudyAttempt and bump mastery.
+    from app.schemas.study import ConceptAssessment
+
+    assessment = ConceptAssessment(
+        concept_id=concept.id, score=0.9, note="Clear definition + example."
+    )
+    with patch(
+        "app.routers.study.study_chat",
+        return_value=("Nice — what's a tighter bound here?", [assessment]),
+    ):
+        headers = _auth_headers(test_user.id)
+        transport = ASGITransport(app=app_with_test_db)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            resp = await c.post(
+                "/study/chat",
+                json={
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Big-O is the worst-case asymptotic upper bound.",
+                        }
+                    ],
+                    "concept_id": str(concept.id),
+                },
+                headers=headers,
+            )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "tighter bound" in body["message"]["content"]
+    assert len(body["updated_concepts"]) == 1
+    assert body["updated_concepts"][0]["mastery_score"] > 0.3
+    assert body["assessments"][0]["score"] == 0.9
+
+
+@pytest.mark.asyncio
+async def test_study_chat_requires_user_last_message(app_with_test_db, test_user):
+    _reset_limits(test_user.id)
+    headers = _auth_headers(test_user.id)
+    transport = ASGITransport(app=app_with_test_db)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/study/chat",
+            json={
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            },
+            headers=headers,
+        )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_study_chat_returns_404_when_no_concepts(app_with_test_db, test_user):
+    _reset_limits(test_user.id)
+    headers = _auth_headers(test_user.id)
+    transport = ASGITransport(app=app_with_test_db)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/study/chat",
+            json={"messages": [{"role": "user", "content": "let's start"}]},
+            headers=headers,
+        )
+    assert resp.status_code == 404

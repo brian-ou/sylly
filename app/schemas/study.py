@@ -7,6 +7,8 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
+from app.schemas.chat import ChatMessage
+
 
 # ---------- Material ingestion ----------
 
@@ -99,3 +101,40 @@ class StudyProgressBucket(BaseModel):
 
 class StudyProgressResponse(BaseModel):
     buckets: List[StudyProgressBucket]
+
+
+# ---------- Conversational study tutor ----------
+
+
+class StudyChatRequest(BaseModel):
+    """Stateless turn against the study tutor.
+
+    `concept_id` pins the conversation to one concept (the AI focuses every
+    question there). `syllabus_id` narrows to a course but lets the AI rotate
+    across its concepts. With neither, the AI works from the user's full
+    weakest set.
+    """
+
+    messages: List[ChatMessage]
+    concept_id: Optional[uuid.UUID] = None
+    syllabus_id: Optional[uuid.UUID] = None
+
+
+class ConceptAssessment(BaseModel):
+    """An inline judgment the tutor emits when the student demonstrates clear
+    understanding (high score) or a clear gap (low score). Persisted as a
+    StudyAttempt; mastery_score is updated via the same EMA used by the
+    quiz-grade endpoint.
+    """
+
+    concept_id: uuid.UUID
+    score: float = Field(..., ge=0, le=1)
+    note: str
+
+
+class StudyChatResponse(BaseModel):
+    message: ChatMessage
+    # The concepts whose mastery changed this turn, hydrated post-update so
+    # the frontend can show a "↑ Big-O 0.40 → 0.55" bump without a refetch.
+    updated_concepts: List[StudyConceptRead] = Field(default_factory=list)
+    assessments: List[ConceptAssessment] = Field(default_factory=list)

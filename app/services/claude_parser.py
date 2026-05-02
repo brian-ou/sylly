@@ -92,7 +92,7 @@ def _strip_code_fences(text: str) -> str:
     return text.strip()
 
 
-def _extract_pdf_text(pdf_bytes: bytes) -> str:
+def extract_pdf_text(pdf_bytes: bytes) -> str:
     """Pull plain text from a PDF using pypdf. Empty string on failure.
 
     Joins pages with a `\n\n--- page N ---\n` separator so date lookups can
@@ -191,7 +191,7 @@ def parse_syllabus_pdf(
         f"\n{OUTPUT_SCHEMA}"
     )
 
-    text = _extract_pdf_text(pdf_bytes)
+    text = extract_pdf_text(pdf_bytes)
     if len(text) >= settings.PARSE_TEXT_MIN_CHARS:
         messages = _build_text_messages(text, hints_text, instructions_text)
         path = "text"

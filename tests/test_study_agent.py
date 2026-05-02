@@ -11,12 +11,15 @@ import pytest
 
 from app.exceptions import ClaudeParseError
 from app.models.study_concept import StudyConcept
+from app.schemas.chat import ChatMessage, ChatRole
 from app.services.study_agent import (
     CORRECT_THRESHOLD,
     apply_attempt_to_concept,
+    build_tutor_system_prompt,
     extract_concepts,
     generate_question,
     grade_answer,
+    study_chat,
     update_mastery,
 )
 
@@ -142,3 +145,83 @@ def test_apply_attempt_increments_correct_only_above_threshold():
     assert c.times_seen == prior_seen + 2
     assert c.times_correct == prior_correct + 1  # not incremented this time
     assert c.last_attempted_at == now
+
+
+# ---------- Tutor (study_chat) ----------
+
+
+def _user_msg(content: str) -> ChatMessage:
+    return ChatMessage(
+        id="m1", role=ChatRole.USER, content=content, created_at="2026-05-01T00:00:00Z"
+    )
+
+
+def test_build_tutor_prompt_includes_focus_and_pool():
+    pool = [_stub_concept()]
+    focused = pool[0]
+    prompt = build_tutor_system_prompt(focused, pool)
+    assert "Focused concept" in prompt
+    assert focused.title in prompt
+    # Concept ids must appear so the model can reference them in assessments.
+    assert str(focused.id) in prompt
+
+
+def test_build_tutor_prompt_handles_no_focus():
+    prompt = build_tutor_system_prompt(None, [_stub_concept()])
+    assert "none — choose from the pool" in prompt
+
+
+def test_study_chat_parses_envelope_and_filters_unknown_concept_ids():
+    pool = [_stub_concept()]
+    valid_id = str(pool[0].id)
+    bogus_id = str(uuid.uuid4())
+    envelope = (
+        "<response>"
+        + json.dumps(
+            {
+                "message": "Why does the heap allow dynamic allocation?",
+                "assessments": [
+                    {
+                        "concept_id": valid_id,
+                        "score": 0.85,
+                        "note": "Correct comparison.",
+                    },
+                    # Hallucinated id — should be filtered out.
+                    {"concept_id": bogus_id, "score": 0.5, "note": "?"},
+                ],
+            }
+        )
+        + "</response>"
+    )
+    client = _mock_client_returning(envelope)
+    text, assessments = study_chat(
+        messages=[_user_msg("the stack stores frames, the heap stores objects")],
+        focus_concept=None,
+        pool_concepts=pool,
+        client=client,
+    )
+    assert "heap" in text.lower()
+    assert len(assessments) == 1
+    assert str(assessments[0].concept_id) == valid_id
+
+
+def test_study_chat_falls_back_to_plain_text_when_envelope_missing():
+    client = _mock_client_returning("Just chatting, no envelope.")
+    text, assessments = study_chat(
+        messages=[_user_msg("hi")],
+        focus_concept=None,
+        pool_concepts=[_stub_concept()],
+        client=client,
+    )
+    assert "Just chatting" in text
+    assert assessments == []
+
+
+def test_study_chat_raises_on_empty_messages():
+    with pytest.raises(ClaudeParseError):
+        study_chat(
+            messages=[],
+            focus_concept=None,
+            pool_concepts=[_stub_concept()],
+            client=_mock_client_returning("ignored"),
+        )
