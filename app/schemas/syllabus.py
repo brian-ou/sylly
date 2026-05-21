@@ -87,6 +87,7 @@ class SyllabusListItem(BaseModel):
     id: uuid.UUID
     filename: str
     course_name: Optional[str] = None
+    course_code: Optional[str] = None
     term: Optional[str] = None
     event_count: int
     created_at: datetime
