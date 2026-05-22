@@ -64,6 +64,13 @@ class EventCreate(BaseModel):
     syllabus_id: Optional[uuid.UUID] = None
 
 
+class QuickAddRequest(BaseModel):
+    """Natural-language event creation, e.g. 'Study for econ midterm Tue 7pm'."""
+
+    text: str = Field(..., min_length=3, max_length=500)
+    syllabus_id: Optional[uuid.UUID] = None
+
+
 class EventUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None

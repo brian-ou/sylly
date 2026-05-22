@@ -30,11 +30,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database import get_db
 from app.deps import get_current_user
-from app.exceptions import GoogleAPIError, InvalidInputError, NotFoundError
+from app.exceptions import (
+    GoogleAPIError,
+    InvalidInputError,
+    NotFoundError,
+    RateLimitExceededError,
+)
 from app.models.event import Event
 from app.models.syllabus import Syllabus
 from app.models.user import User
-from app.schemas.event import EventCreate, EventRead, EventUpdate
+from app.schemas.event import EventCreate, EventRead, EventUpdate, QuickAddRequest
 from app.services.event_sync import sync_event_to_google
 from app.services.google_calendar import (
     delete_event as gcal_delete_event,
@@ -43,6 +48,8 @@ from app.services.google_calendar import (
     update_event as gcal_update_event,
     update_recurring_instance,
 )
+from app.services.quick_add import parse_quick_event
+from app.services.rate_limit import chat_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -291,10 +298,20 @@ async def create_event(
     db: AsyncSession = Depends(get_db),
 ) -> EventRead:
     """Create a new event and best-effort push it to Google Calendar."""
+    event = await _persist_and_sync_event(body, current_user, db)
+    return EventRead.model_validate(event)
+
+
+async def _persist_and_sync_event(
+    body: EventCreate, user: User, db: AsyncSession
+) -> Event:
+    """Validate ownership, create the Event row, and best-effort push to
+    Google Calendar. Shared by POST /events and POST /events/quick-add.
+    """
     if body.syllabus_id is not None:
         stmt = select(Syllabus).where(
             Syllabus.id == body.syllabus_id,
-            Syllabus.user_id == current_user.id,
+            Syllabus.user_id == user.id,
         )
         syllabus = (await db.execute(stmt)).scalar_one_or_none()
         if syllabus is None:
@@ -312,7 +329,7 @@ async def create_event(
 
     event = Event(
         syllabus_id=body.syllabus_id,
-        user_id=current_user.id,
+        user_id=user.id,
         title=body.title,
         description=body.description,
         start_datetime=start_dt,
@@ -330,7 +347,7 @@ async def create_event(
     # Best-effort push to Google Calendar. On failure the row stays in our
     # DB unsynced; the user can retry later or via the syllabus sync flow.
     try:
-        await sync_event_to_google(event, current_user, db)
+        await sync_event_to_google(event, user, db)
         await db.commit()
         await db.refresh(event)
     except Exception as exc:  # noqa: BLE001
@@ -340,6 +357,39 @@ async def create_event(
             exc,
         )
 
+    return event
+
+
+@router.post(
+    "/quick-add",
+    response_model=EventRead,
+    status_code=201,
+    summary="Create an event from a natural-language note",
+)
+async def quick_add_event(
+    body: QuickAddRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> EventRead:
+    """Parse a short note (e.g. 'Study for econ midterm Tuesday 7pm') into a
+    single event and create it. Reuses the chat rate limiter since it's a
+    per-call model invocation.
+    """
+    if not chat_limiter.check(str(current_user.id)):
+        raise RateLimitExceededError("Too many requests — try again in a bit")
+
+    parsed = parse_quick_event(body.text)
+
+    create_body = EventCreate(
+        title=parsed.title,
+        start_datetime=parsed.start_datetime,
+        end_datetime=parsed.end_datetime,
+        is_all_day=parsed.is_all_day,
+        event_type=parsed.event_type,
+        description=parsed.description,
+        syllabus_id=body.syllabus_id,
+    )
+    event = await _persist_and_sync_event(create_body, current_user, db)
     return EventRead.model_validate(event)
 
 
